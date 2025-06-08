@@ -1,6 +1,6 @@
 # MIT License
 
-# Copyright (c) 2024 Danyal Zia
+# Copyright (c) 2025 Danyal Zia
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -371,8 +371,9 @@ if __name__ == "__main__":
         supported_values = get_gamma_allowed_values(
             SetDeviceGammaRamp, hdc, default_gamma_ramp
         )
-        min_gamma_allowed, max_gamma_allowed = min(supported_values), max(
-            supported_values
+        min_gamma_allowed, max_gamma_allowed = (
+            min(supported_values),
+            max(supported_values),
         )
 
         gamma_map: dict[float, float] = {}

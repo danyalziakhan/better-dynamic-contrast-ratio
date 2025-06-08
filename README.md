@@ -43,7 +43,7 @@ Only Windows is supported at the moment.
 
 ## Installation
 
-Install Python 3.12.5: <https://www.python.org/ftp/python/3.12.5/python-3.12.5-amd64.exe>
+Install Python 3.13.4: <https://www.python.org/ftp/python/3.13.4/python-3.13.4-amd64.exe>
 
 1. Clone the repository: `git clone https://github.com/danyalzia/better-dynamic-contrast-ratio.git`
 2. Navigate to the project directory: `cd better-dynamic-contrast-ratio`
