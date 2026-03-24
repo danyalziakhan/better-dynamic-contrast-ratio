@@ -366,29 +366,33 @@ if __name__ == "__main__":
                     target_monitor_luminance = int(clamp(abs(round(luma_for_luminance)), 0, 100))
                     target_luminance_map_value = luminance_map[target_monitor_luminance]
 
-                    if target_monitor_luminance == current_monitor_luminance:
+                    # Use the mapped value for comparison to ensure we are
+                    # checking the actual value sent to the hardware.
+                    if target_luminance_map_value == current_monitor_luminance:
                         continue
 
-                    luma_delta = abs(target_monitor_luminance - current_monitor_luminance)
+                    # Calculate delta based on the mapped values
+                    luma_delta = abs(target_luminance_map_value - current_monitor_luminance)
 
-                    if luma_delta == 1:
-                        continue
-
-                    if luma_delta > config.LUMA_DIFFERENCE_THRESHOLD:
+                    if luma_delta <= config.LUMA_DIFFERENCE_THRESHOLD:
                         # All brightness changes are now instant. Temporal smoothing
                         # (when enabled and FORCE_INSTANT is False) already provides
                         # gradual-feeling transitions by smoothing the target value
-                        # itself, so a separate fade mechanism is not needed.
-                        threading.Thread(
-                            target=vcp_set_luminance,
-                            args=(handle, target_luminance_map_value),
-                            daemon=True,
-                        ).start()
-                        print(
-                            f"Luminance: {target_luminance_map_value} (from {current_monitor_luminance})"
-                        )
+                        # itself, so a separate fade mechanism is not needed
+                        continue
 
-                        current_monitor_luminance = target_monitor_luminance
+                    threading.Thread(
+                        target=vcp_set_luminance,
+                        args=(handle, target_luminance_map_value),
+                        daemon=True,
+                    ).start()
+
+                    print(
+                        f"Luminance: {target_luminance_map_value} (from {current_monitor_luminance})"
+                    )
+
+                    # Update to the mapped value so the "from" print is accurate next time
+                    current_monitor_luminance = target_luminance_map_value
 
     except KeyboardInterrupt:
         print("\n[!] Interrupted. Restoring default display settings.\n")
