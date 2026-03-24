@@ -23,18 +23,15 @@
 import math
 import threading
 import time
-
 from ctypes import Structure, byref, windll
 from ctypes.wintypes import BYTE, DWORD, HANDLE, HDC, WCHAR
 
 import cv2
 import numpy as np
-
 from numba import njit
 from zbl import Capture
 
 import config
-
 
 # Luminance formulas for reference. Only luminance_from_grayscale is used in
 # the main loop since it is the fastest and the frame is already grayscale.
@@ -96,9 +93,7 @@ def vcp_get_luminance(handle) -> int:
 def get_default_gamma_ramp(GetDeviceGammaRamp, hdc) -> np.ndarray:
     ramp = np.empty((3, 256), dtype=np.uint16)
     if not GetDeviceGammaRamp(hdc, ramp.ctypes):
-        raise RuntimeError(
-            "Failed to read the current gamma ramp from the display driver."
-        )
+        raise RuntimeError("Failed to read the current gamma ramp from the display driver.")
     return ramp
 
 
@@ -118,9 +113,7 @@ def probe_supported_gamma_range(
         if SetDeviceGammaRamp(hdc, scale_gamma_ramp(multiplier, base_ramp).ctypes):
             accepted.append(multiplier)
     if not accepted:
-        raise RuntimeError(
-            "Driver accepted no gamma multipliers in the 0.50-1.50 range."
-        )
+        raise RuntimeError("Driver accepted no gamma multipliers in the 0.50-1.50 range.")
     return min(accepted), max(accepted)
 
 
@@ -171,7 +164,7 @@ def build_tone_curve_ramp(
 
     # Selective Reflectance Scaling: amplify the reflectance component for
     # pixels brighter than the scene average.
-    brighter = L > scene_mean
+    brighter = scene_mean < L
     factor = np.where(brighter, np.sqrt(np.maximum(L / scene_mean, 0.0)), 1.0)
     R_new = R_val * factor
 
@@ -260,9 +253,7 @@ if __name__ == "__main__":
         )
         print("Adaptive tone curve: ready.")
         print(f"Tone curve strength:   {config.TONE_CURVE_STRENGTH}")
-        print(
-            f"Driver gamma range:    [{min_gamma_multiplier:.2f}, {max_gamma_multiplier:.2f}]"
-        )
+        print(f"Driver gamma range:    [{min_gamma_multiplier:.2f}, {max_gamma_multiplier:.2f}]")
         print()
 
     luminance_map: dict[int, int] = {
@@ -274,13 +265,12 @@ if __name__ == "__main__":
                 config.MIN_DESIRED_MONITOR_LUMINANCE,
                 config.MAX_DESIRED_MONITOR_LUMINANCE,
             ),
+            strict=False,
         )
     }
     print(f"Min monitor luminance: {config.MIN_DESIRED_MONITOR_LUMINANCE}")
     print(f"Max monitor luminance: {config.MAX_DESIRED_MONITOR_LUMINANCE}")
-    print(
-        f"Monitor luminance values: {', '.join(str(v) for v in luminance_map.values())}"
-    )
+    print(f"Monitor luminance values: {', '.join(str(v) for v in luminance_map.values())}")
     print()
 
     handle = get_primary_monitor_handle()
@@ -310,9 +300,7 @@ if __name__ == "__main__":
                 try:
                     raw_luma = luminance_from_grayscale(frame)
                 except ValueError as e:
-                    raise RuntimeError(
-                        "Cannot compute average luminance of the frame."
-                    ) from e
+                    raise RuntimeError("Cannot compute average luminance of the frame.") from e
 
                 # Gamma always uses EMA when smoothing is on, giving the eye
                 # adaptation effect.
@@ -375,17 +363,13 @@ if __name__ == "__main__":
                         )
 
                 if config.MONITOR_LUMINANCE_ADJUSTMENTS:
-                    target_monitor_luminance = int(
-                        clamp(abs(round(luma_for_luminance)), 0, 100)
-                    )
+                    target_monitor_luminance = int(clamp(abs(round(luma_for_luminance)), 0, 100))
                     target_luminance_map_value = luminance_map[target_monitor_luminance]
 
                     if target_monitor_luminance == current_monitor_luminance:
                         continue
 
-                    luma_delta = abs(
-                        target_monitor_luminance - current_monitor_luminance
-                    )
+                    luma_delta = abs(target_monitor_luminance - current_monitor_luminance)
 
                     if luma_delta == 1:
                         continue

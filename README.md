@@ -41,13 +41,12 @@ Only Windows is supported at the moment.
 
 ## Installation
 
-Install Python 3.13: <https://www.python.org/downloads/>
+1. Install **uv**: <https://github.com/astral-sh/uv>
+2. Clone the repository: `git clone https://github.com/danyalziakhan/better-dynamic-contrast-ratio.git`
+3. Navigate to the project directory: `cd better-dynamic-contrast-ratio`
+4. Run the program: `uv run main.py` (or use the `run.bat` script)
 
-1. Clone the repository: `git clone https://github.com/danyalziakhan/better-dynamic-contrast-ratio.git`
-2. Navigate to the project directory: `cd better-dynamic-contrast-ratio`
-3. Create a Python virtual environment: `python -m venv .venv`
-4. Install dependencies: `pip install -r requirements.txt`
-5. Run the program: `python main.py` (or use the `run.bat` script)
+> **Note**: `uv run` will automatically create the virtual environment and install the required Python version (3.13) and dependencies on the first run.
 
 ## License
 
