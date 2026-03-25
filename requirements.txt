@@ -2,6 +2,8 @@
 #    uv pip compile pyproject.toml -o requirements.txt
 llvmlite==0.46.0
     # via numba
+mss==10.1.0
+    # via better-dynamic-contrast-ratio (pyproject.toml)
 numba==0.64.0
     # via better-dynamic-contrast-ratio (pyproject.toml)
 numpy==2.4.3
@@ -11,6 +13,8 @@ numpy==2.4.3
     #   opencv-python
     #   zbl
 opencv-python==4.13.0.92
+    # via better-dynamic-contrast-ratio (pyproject.toml)
+pillow==12.1.1
     # via better-dynamic-contrast-ratio (pyproject.toml)
 zbl==0.7.1
     # via better-dynamic-contrast-ratio (pyproject.toml)

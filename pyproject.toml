@@ -23,9 +23,11 @@ classifiers = [
     "Topic :: System :: Hardware",
 ]
 dependencies = [
+    "mss>=10.1.0",
     "numba>=0.64.0",
     "numpy>=2.4.3",
     "opencv-python>=4.13.0.92",
+    "pillow>=12.1.1",
     "zbl>=0.7.1",
 ]
 

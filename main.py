@@ -297,6 +297,19 @@ if __name__ == "__main__":
                 frame = next(frames)
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
 
+                h, w = frame.shape
+                crop_t = config.CAPTURE_CROP_TOP
+                crop_b = config.CAPTURE_CROP_BOTTOM
+                crop_l = config.CAPTURE_CROP_LEFT
+                crop_r = config.CAPTURE_CROP_RIGHT
+                if crop_t or crop_b or crop_l or crop_r:
+                    frame = frame[
+                        crop_t : h - crop_b if crop_b else h,
+                        crop_l : w - crop_r if crop_r else w,
+                    ]
+                    if frame.size == 0:
+                        raise RuntimeError("Crop values exceed frame dimensions.")
+
                 try:
                     raw_luma = luminance_from_grayscale(frame)
                 except ValueError as e:

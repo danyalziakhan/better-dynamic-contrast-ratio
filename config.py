@@ -79,3 +79,13 @@ GAMMA_DIFFERENCE_THRESHOLD = 0.1
 # Minimum brightness change (0-100) needed to trigger a luminance adjustment.
 # Raise this if brightness flickers on content that is mostly static.
 LUMA_DIFFERENCE_THRESHOLD = 0.0
+
+# -- Capture Crop -------------------------------------------------------------
+
+# Crop pixels from each edge of the captured frame before luminance is computed.
+# Useful for ignoring black bars (e.g. a 16:9 game on a 16:10 monitor).
+# Set to 0 to disable cropping on that edge.
+CAPTURE_CROP_TOP    = 0
+CAPTURE_CROP_BOTTOM = 0
+CAPTURE_CROP_LEFT   = 0
+CAPTURE_CROP_RIGHT  = 0
