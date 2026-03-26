@@ -23,11 +23,9 @@ classifiers = [
     "Topic :: System :: Hardware",
 ]
 dependencies = [
-    "mss>=10.1.0",
     "numba>=0.64.0",
     "numpy>=2.4.3",
     "opencv-python>=4.13.0.92",
-    "pillow>=12.1.1",
     "zbl>=0.7.1",
 ]
 
@@ -36,7 +34,14 @@ Homepage = "https://github.com/danyalziakhan/better-dynamic-contrast-ratio"
 "Bug Tracker" = "https://github.com/danyalziakhan/better-dynamic-contrast-ratio/issues"
 
 [dependency-groups]
-dev = ["pre-commit>=4.5.1", "ruff>=0.15.7"]
+dev = [
+    "dxcam>=0.0.5",
+    "mss>=10.1.0",
+    "pillow>=12.1.1",
+    "pre-commit>=4.5.1",
+    "ruff>=0.15.7",
+    "windows-capture>=1.5.0",
+]
 
 [build-system]
 requires = ["hatchling"]

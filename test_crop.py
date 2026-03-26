@@ -33,7 +33,6 @@ Run this to verify your crop values before using them in the main script.
 import sys
 
 import mss
-import numpy as np
 from PIL import Image, ImageDraw
 
 import config
