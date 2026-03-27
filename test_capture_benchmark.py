@@ -165,18 +165,14 @@ def run_dxcam_in_thread(result: dict) -> None:
 
     try:
         camera = dxcam.create(output_idx=MONITOR_INDEX, output_color="GRAY")
+        camera.start(target_fps=0)  # uncapped, runs as fast as possible
         total = FRAME_COUNT + WARMUP_FRAMES
         captured = 0
 
         while captured < total:
             t0 = time.perf_counter()
-            # new_frame_only=False always returns the latest frame rather than
-            # None when the screen hasn't changed, which is what we want here.
-            frame = camera.grab(new_frame_only=False)
+            camera.get_latest_frame()
             t1 = time.perf_counter()
-
-            if frame is None:
-                continue
 
             if captured >= WARMUP_FRAMES:
                 latencies.append((t1 - t0) * 1000.0)

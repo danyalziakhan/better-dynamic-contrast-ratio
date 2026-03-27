@@ -26,10 +26,9 @@ import time
 from ctypes import Structure, byref, windll
 from ctypes.wintypes import BYTE, DWORD, HANDLE, HDC, WCHAR
 
-import cv2
+import dxcam
 import numpy as np
 from numba import njit
-from zbl import Capture
 
 import config
 
@@ -286,29 +285,29 @@ if __name__ == "__main__":
     smoothed_luma_luminance: float = -1.0
 
     try:
-        with Capture(
-            display_id=config.MONITOR_INDEX,
-            is_cursor_capture_enabled=False,
-            is_border_required=False,
-        ) as cap:
-            frames = cap.frames()
+        with dxcam.create(output_idx=config.MONITOR_INDEX, output_color="GRAY") as camera:
+            screen_h, screen_w = camera.height, camera.width
+
+            crop_t = config.CAPTURE_CROP_TOP
+            crop_b = config.CAPTURE_CROP_BOTTOM
+            crop_l = config.CAPTURE_CROP_LEFT
+            crop_r = config.CAPTURE_CROP_RIGHT
+
+            left = crop_l
+            top = crop_t
+            right = screen_w - crop_r if crop_r else screen_w
+            bottom = screen_h - crop_b if crop_b else screen_h
+
+            if left >= right or top >= bottom:
+                raise RuntimeError("Crop values exceed frame dimensions.")
+
+            region = (left, top, right, bottom)
+
+            camera.start(region=region, target_fps=0)  # uncapped, runs as fast as possible
 
             while True:
-                frame = next(frames)
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-
-                h, w = frame.shape
-                crop_t = config.CAPTURE_CROP_TOP
-                crop_b = config.CAPTURE_CROP_BOTTOM
-                crop_l = config.CAPTURE_CROP_LEFT
-                crop_r = config.CAPTURE_CROP_RIGHT
-                if crop_t or crop_b or crop_l or crop_r:
-                    frame = frame[
-                        crop_t : h - crop_b if crop_b else h,
-                        crop_l : w - crop_r if crop_r else w,
-                    ]
-                    if frame.size == 0:
-                        raise RuntimeError("Crop values exceed frame dimensions.")
+                if (frame := camera.get_latest_frame()) is None:
+                    continue
 
                 try:
                     raw_luma = luminance_from_grayscale(frame)
