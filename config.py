@@ -49,6 +49,19 @@ MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS = 50
 MIN_DESIRED_MONITOR_LUMINANCE = 0
 MAX_DESIRED_MONITOR_LUMINANCE = 100
 
+# Scene statistic that drives the backlight: a percentile of the luma
+# histogram. 95 tracks the highlights, so a dark scene with a small bright
+# area (moon, torch, muzzle flash) keeps the backlight up instead of crushing
+# it -- the case where the mean fails. 50 would track the median instead.
+LUMINANCE_SCENE_PERCENTILE = 95
+
+# Perceptual mapping from that statistic (0-1) to the backlight level: the
+# statistic is raised to this power before entering the brightness window.
+# 1.0 = linear. 2.2 approximates the display transfer, so the backlight tracks
+# the linear light the highlights actually need; higher values dim mid-bright
+# scenes more, leaving headroom for true highlights.
+LUMINANCE_MAPPING_EXPONENT = 2.2
+
 
 # -- Adaptive Tone Curve ------------------------------------------------------
 
@@ -62,6 +75,17 @@ TONE_CURVE_STRENGTH = 0.5
 # Minimum time between gamma ramp writes, in milliseconds. Caps how often the
 # tone curve is recomputed and applied during fast luma swings.
 GAMMA_RAMP_MIN_WRITE_INTERVAL_MS = 33
+
+# Compensate the tone curve for the backlight level actually applied to the
+# hardware, so the two systems cooperate instead of both chasing the scene on
+# their own: when the backlight dims, shadows and mids are lifted back toward
+# how the content looked at your default backlight (whites stay anchored), and
+# pulled down when it brightens. Requires MONITOR_LUMINANCE_ADJUSTMENTS.
+GAMMA_BACKLIGHT_COMPENSATION = True
+
+# 0.0 = no compensation, 1.0 = full compensation toward constant perceived
+# brightness. The correction is capped by the driver's accepted gamma window.
+GAMMA_BACKLIGHT_COMPENSATION_STRENGTH = 0.5
 
 
 # -- Temporal Smoothing -------------------------------------------------------
