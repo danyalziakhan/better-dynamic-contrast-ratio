@@ -20,11 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import atexit
 import math
 import threading
 import time
-from ctypes import Structure, byref, windll
-from ctypes.wintypes import BYTE, DWORD, HANDLE, HDC, WCHAR
+from ctypes import WINFUNCTYPE, Structure, byref, windll
+from ctypes.wintypes import BOOL, BYTE, DWORD, HANDLE, HDC, WCHAR
 
 import dxcam
 import numpy as np
@@ -279,6 +280,40 @@ if __name__ == "__main__":
 
     current_monitor_luminance = default_monitor_luminance
 
+    # Restore the display on every exit path, not just Ctrl+C: normal exit and
+    # unhandled exceptions go through finally/atexit, while closing the console
+    # window (or logoff/shutdown) only gives us a console ctrl event, so a
+    # handler is registered for that too. The flag makes restore idempotent
+    # since more than one of these paths can fire for the same exit.
+    restore_done = threading.Event()
+
+    def restore_defaults() -> None:
+        if restore_done.is_set():
+            return
+        restore_done.set()
+
+        if (
+            config.GAMMA_RAMP_ADJUSTMENTS
+            and SetDeviceGammaRamp is not None
+            and default_gamma_ramp is not None
+        ):
+            reset_gamma_to_default(SetDeviceGammaRamp, default_gamma_ramp)
+
+        vcp_set_luminance(get_primary_monitor_handle(), default_monitor_luminance)
+
+    atexit.register(restore_defaults)
+
+    # CTRL_CLOSE_EVENT = 2, CTRL_LOGOFF_EVENT = 5, CTRL_SHUTDOWN_EVENT = 6.
+    # Ctrl+C / Ctrl+Break (0 and 1) are left to Python's own handler so the
+    # KeyboardInterrupt path still works; returning False passes the event on.
+    @WINFUNCTYPE(BOOL, DWORD)
+    def console_ctrl_handler(event: int) -> bool:
+        if event in (2, 5, 6):
+            restore_defaults()
+        return False
+
+    windll.kernel32.SetConsoleCtrlHandler(console_ctrl_handler, True)
+
     # Separate EMA accumulators for gamma and luminance. They react at different
     # speeds and have independent alphas in config.
     smoothed_luma_gamma: float = -1.0
@@ -407,17 +442,9 @@ if __name__ == "__main__":
                     current_monitor_luminance = target_luminance_map_value
 
     except KeyboardInterrupt:
-        print("\n[!] Interrupted. Restoring default display settings.\n")
-
-        if (
-            config.GAMMA_RAMP_ADJUSTMENTS
-            and SetDeviceGammaRamp is not None
-            and default_gamma_ramp is not None
-        ):
-            reset_gamma_to_default(SetDeviceGammaRamp, default_gamma_ramp)
-
-        handle = get_primary_monitor_handle()
-        vcp_set_luminance(handle, default_monitor_luminance)
-
+        print("\n[!] Interrupted.\n")
+    finally:
+        print("\n[!] Restoring default display settings.\n")
+        restore_defaults()
         print("[!] Done.\n")
         time.sleep(1)
