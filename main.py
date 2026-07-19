@@ -77,8 +77,8 @@ def get_primary_monitor_handle() -> HANDLE:
     return physical_monitors[0].handle
 
 
-def vcp_set_luminance(handle, value: int) -> None:
-    windll.dxva2.SetVCPFeature(HANDLE(handle), BYTE(0x10), DWORD(value))
+def vcp_set_luminance(handle, value: int) -> bool:
+    return bool(windll.dxva2.SetVCPFeature(HANDLE(handle), BYTE(0x10), DWORD(value)))
 
 
 def vcp_get_luminance(handle) -> int:
@@ -100,21 +100,42 @@ class VcpLuminanceWriter:
     SetVCPFeature calls on the same I2C bus have no ordering guarantee.
     The pause after each write both gives the DDC/CI receiver time to settle
     and caps the total write rate (see the EEPROM warning in the README).
+
+    The writer is also the source of truth for the monitor's luminance state:
+    it only records a value once the driver confirms the write, so a failed
+    write leaves the recorded state at the old value and the caller's next
+    submit of the still-differing target acts as a natural, rate-limited retry.
     """
 
-    def __init__(self, handle, min_write_interval_s: float) -> None:
+    def __init__(self, handle, min_write_interval_s: float, initial_value: int) -> None:
         self._handle = handle
         self._min_write_interval_s = min_write_interval_s
         self._cond = threading.Condition()
         self._target: int | None = None
+        self._last_written = initial_value
+        self._write_failing = False
         self._stopped = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit(self, value: int) -> None:
+    def submit(self, value: int) -> bool:
+        """Queue a new target. Returns False if it is already the effective
+        state (pending or confirmed written) and nothing was queued."""
         with self._cond:
+            if self._stopped:
+                return False
+            effective = self._target if self._target is not None else self._last_written
+            if value == effective:
+                return False
             self._target = value
             self._cond.notify()
+            return True
+
+    def effective_luminance(self) -> int:
+        """The pending target if one is queued, else the last value the
+        driver confirmed as written."""
+        with self._cond:
+            return self._target if self._target is not None else self._last_written
 
     def stop(self) -> None:
         # Pending unwritten targets are dropped; the caller decides what the
@@ -135,7 +156,14 @@ class VcpLuminanceWriter:
                     return
                 value = self._target
                 self._target = None
-            vcp_set_luminance(self._handle, value)
+            ok = vcp_set_luminance(self._handle, value)
+            with self._cond:
+                if ok:
+                    self._last_written = value
+                    self._write_failing = False
+                elif not self._write_failing:
+                    self._write_failing = True
+                    print("[!] DDC/CI brightness write failed; retrying with the newest target.")
             # Sleep outside the lock so newer targets coalesce in the mailbox
             # while the bus settles.
             time.sleep(self._min_write_interval_s)
@@ -354,10 +382,10 @@ if __name__ == "__main__":
     print(f"Default monitor luminance: {default_monitor_luminance}")
     print()
 
-    current_monitor_luminance = default_monitor_luminance
-
     luminance_writer = VcpLuminanceWriter(
-        handle, config.MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS / 1000.0
+        handle,
+        config.MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS / 1000.0,
+        default_monitor_luminance,
     )
 
     # Restore the display on every exit path, not just Ctrl+C: normal exit and
@@ -496,12 +524,14 @@ if __name__ == "__main__":
                     target_monitor_luminance = int(clamp(abs(round(luma_for_luminance)), 0, 100))
                     target_luminance_map_value = luminance_map[target_monitor_luminance]
 
-                    # Use the mapped value for comparison to ensure we are
-                    # checking the actual value sent to the hardware.
-                    if target_luminance_map_value == current_monitor_luminance:
-                        continue
+                    # Compare against the writer's view of the hardware state
+                    # (pending target, else last driver-confirmed write) so a
+                    # failed write is retried instead of being assumed applied.
+                    current_monitor_luminance = luminance_writer.effective_luminance()
 
-                    # Calculate delta based on the mapped values
+                    # Delta based on mapped values, i.e. what is actually sent
+                    # to the hardware. Also covers equality when the threshold
+                    # is 0.
                     luma_delta = abs(target_luminance_map_value - current_monitor_luminance)
 
                     if luma_delta <= config.LUMA_DIFFERENCE_THRESHOLD:
@@ -511,14 +541,10 @@ if __name__ == "__main__":
                         # itself, so a separate fade mechanism is not needed
                         continue
 
-                    luminance_writer.submit(target_luminance_map_value)
-
-                    print(
-                        f"Luminance: {target_luminance_map_value} (from {current_monitor_luminance})"
-                    )
-
-                    # Update to the mapped value so the "from" print is accurate next time
-                    current_monitor_luminance = target_luminance_map_value
+                    if luminance_writer.submit(target_luminance_map_value):
+                        print(
+                            f"Luminance: {target_luminance_map_value} (from {current_monitor_luminance})"
+                        )
 
     except KeyboardInterrupt:
         print("\n[!] Interrupted.\n")
