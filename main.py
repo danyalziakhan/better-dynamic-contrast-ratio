@@ -271,6 +271,21 @@ def vig_scale(v: float, scene_mean: float) -> float:
     return r * (1.0 / (1.0 + math.exp(-(v - scene_mean))) - 0.5)
 
 
+def remap_ratio_to_multiplier(
+    raw_ratio: np.ndarray, min_multiplier: float, max_multiplier: float
+) -> np.ndarray:
+    # Piecewise-linear remap of the [0, 3] tone curve output into the driver's
+    # accepted multiplier window, anchored so a ratio of 1.0 (no change) maps
+    # to a multiplier of exactly 1.0. A plain linear remap of the whole [0, 3]
+    # range would move the identity point and put a constant darkening bias on
+    # neutral scenes.
+    return np.where(
+        raw_ratio <= 1.0,
+        min_multiplier + np.clip(raw_ratio, 0.0, 1.0) * (1.0 - min_multiplier),
+        1.0 + (np.clip(raw_ratio, 1.0, 3.0) - 1.0) * ((max_multiplier - 1.0) / 2.0),
+    )
+
+
 def build_tone_curve_ramp(
     base_ramp: np.ndarray,
     scene_mean_norm: float,
@@ -325,9 +340,9 @@ def build_tone_curve_ramp(
     L_final = A / (B + 1e-6)
     raw_ratio = np.clip(L_final / L, 0.0, 3.0)
 
-    # Remap the [0, 3] tone curve output into the driver's accepted multiplier
-    # window so the ramp is always valid, then blend with the identity by strength.
-    remapped = min_multiplier + (raw_ratio / 3.0) * (max_multiplier - min_multiplier)
+    # Remap into the driver's accepted multiplier window (identity-anchored,
+    # so the ramp is always valid), then blend with the identity by strength.
+    remapped = remap_ratio_to_multiplier(raw_ratio, min_multiplier, max_multiplier)
     effective_ratio = 1.0 + (remapped - 1.0) * internal_strength
 
     new_ramp = np.clip(
@@ -358,6 +373,42 @@ def ema(current: float, previous: float, alpha: float) -> float:
     return alpha * current + (1.0 - alpha) * previous
 
 
+def ema_alpha(dt: float, tau: float) -> float:
+    # EMA weight for a step of dt seconds under time constant tau, derived from
+    # the continuous-time filter. Makes smoothing speed independent of frame
+    # rate: the same wall-clock time always produces the same adaptation,
+    # whether that time spanned 10 frames or 100.
+    if tau <= 0.0:
+        return 1.0
+    return 1.0 - math.exp(-dt / tau)
+
+
+def evaluate_deadband(
+    luma_delta: float,
+    threshold: float,
+    now: float,
+    deadband_since: float | None,
+    settle_seconds: float,
+) -> tuple[bool, float | None]:
+    """Decide whether a brightness change should be applied given the deadband.
+
+    Changes above the threshold apply immediately. Changes within the deadband
+    are held back to avoid flicker, but if the offset persists for
+    settle_seconds it is applied anyway -- a plain deadband would otherwise
+    leave the brightness stuck up to `threshold` away from the target forever.
+    Returns (apply, new_deadband_since).
+    """
+    if luma_delta == 0:
+        return False, None
+    if luma_delta > threshold:
+        return True, None
+    if deadband_since is None:
+        return False, now
+    if now - deadband_since >= settle_seconds:
+        return True, None
+    return False, deadband_since
+
+
 if __name__ == "__main__":
     np.seterr(divide="ignore", over="ignore")
 
@@ -369,9 +420,13 @@ if __name__ == "__main__":
     max_gamma_multiplier: float = 1.5
 
     # Separate EMA accumulators for gamma and luminance. They react at different
-    # speeds and have independent alphas in config.
+    # speeds and have independent time constants in config.
     smoothed_luma_gamma: float = -1.0
     smoothed_luma_luminance: float = -1.0
+
+    last_frame_time: float | None = None
+    last_gamma_write_time: float = 0.0
+    deadband_since: float | None = None
 
     with dxcam.create(output_idx=config.MONITOR_INDEX, output_color="GRAY") as camera:
         # The camera knows which DXGI output it captures; derive the DDC/CI
@@ -507,13 +562,19 @@ if __name__ == "__main__":
                 if (frame := camera.get_latest_frame()) is None:
                     continue
 
+                now = time.perf_counter()
+                dt = 0.0 if last_frame_time is None else now - last_frame_time
+                last_frame_time = now
+
                 try:
                     raw_luma = luminance_from_grayscale(frame)
                 except ValueError as e:
                     raise RuntimeError("Cannot compute average luminance of the frame.") from e
 
                 # Gamma always uses EMA when smoothing is on, giving the eye
-                # adaptation effect.
+                # adaptation effect. The EMA weight is derived from the elapsed
+                # wall-clock time between frames, so adaptation speed does not
+                # depend on the capture frame rate.
                 #
                 # For luminance: when FORCE_INSTANT is True, brightness changes
                 # are applied immediately with no smoothing. When False, temporal
@@ -528,7 +589,7 @@ if __name__ == "__main__":
                         smoothed_luma_gamma = ema(
                             raw_luma,
                             smoothed_luma_gamma,
-                            config.TEMPORAL_SMOOTHING_GAMMA_ALPHA,
+                            ema_alpha(dt, config.TEMPORAL_SMOOTHING_GAMMA_TAU),
                         )
                     luma_for_gamma = smoothed_luma_gamma
 
@@ -541,7 +602,7 @@ if __name__ == "__main__":
                             smoothed_luma_luminance = ema(
                                 raw_luma,
                                 smoothed_luma_luminance,
-                                config.TEMPORAL_SMOOTHING_LUMINANCE_ALPHA,
+                                ema_alpha(dt, config.TEMPORAL_SMOOTHING_LUMINANCE_TAU),
                             )
                         luma_for_luminance = smoothed_luma_luminance
                 else:
@@ -556,8 +617,15 @@ if __name__ == "__main__":
                     scene_mean_norm = luma_for_gamma / 100.0
                     luma_delta = abs(scene_mean_norm - prev_scene_mean_norm)
 
-                    if prev_scene_mean_norm < 0 or luma_delta > (
-                        config.GAMMA_DIFFERENCE_THRESHOLD / 100.0
+                    # Rate-cap ramp writes on top of the change threshold:
+                    # recomputing and applying the ramp at capture rate during
+                    # fast luma swings wastes CPU and can stutter games.
+                    gamma_write_due = (now - last_gamma_write_time) * 1000.0 >= (
+                        config.GAMMA_RAMP_MIN_WRITE_INTERVAL_MS
+                    )
+
+                    if prev_scene_mean_norm < 0 or (
+                        gamma_write_due and luma_delta > (config.GAMMA_DIFFERENCE_THRESHOLD / 100.0)
                     ):
                         tone_ramp = build_tone_curve_ramp(
                             default_gamma_ramp,
@@ -568,6 +636,7 @@ if __name__ == "__main__":
                         )
                         apply_gamma_ramp(SetDeviceGammaRamp, hdc, tone_ramp)
                         prev_scene_mean_norm = scene_mean_norm
+                        last_gamma_write_time = now
                         print(
                             f"Tone curve: scene_mean={scene_mean_norm:.3f}  strength={config.TONE_CURVE_STRENGTH}"
                         )
@@ -582,15 +651,17 @@ if __name__ == "__main__":
                     current_monitor_luminance = luminance_writer.effective_luminance()
 
                     # Delta based on mapped values, i.e. what is actually sent
-                    # to the hardware. Also covers equality when the threshold
-                    # is 0.
+                    # to the hardware.
                     luma_delta = abs(target_luminance_map_value - current_monitor_luminance)
 
-                    if luma_delta <= config.LUMA_DIFFERENCE_THRESHOLD:
-                        # All brightness changes are now instant. Temporal smoothing
-                        # (when enabled and FORCE_INSTANT is False) already provides
-                        # gradual-feeling transitions by smoothing the target value
-                        # itself, so a separate fade mechanism is not needed
+                    apply_change, deadband_since = evaluate_deadband(
+                        luma_delta,
+                        config.LUMA_DIFFERENCE_THRESHOLD,
+                        now,
+                        deadband_since,
+                        config.LUMA_DEADBAND_SETTLE_SECONDS,
+                    )
+                    if not apply_change:
                         continue
 
                     if luminance_writer.submit(target_luminance_map_value):

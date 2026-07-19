@@ -59,6 +59,10 @@ GAMMA_RAMP_ADJUSTMENTS = True
 # How strongly to apply the tone curve. Range 0.1 (subtle) to 1.0 (full effect).
 TONE_CURVE_STRENGTH = 0.5
 
+# Minimum time between gamma ramp writes, in milliseconds. Caps how often the
+# tone curve is recomputed and applied during fast luma swings.
+GAMMA_RAMP_MIN_WRITE_INTERVAL_MS = 33
+
 
 # -- Temporal Smoothing -------------------------------------------------------
 
@@ -67,26 +71,32 @@ TONE_CURVE_STRENGTH = 0.5
 # from causing rapid adjustments.
 TEMPORAL_SMOOTHING = True
 
-# How quickly the tone curve reacts to luma changes. Lower = slower/smoother
-# eye adaptation. Higher = faster but less stable.
-TEMPORAL_SMOOTHING_GAMMA_ALPHA = 0.1
+# Time constant (in seconds) for the tone curve's reaction to luma changes.
+# Higher = slower/smoother eye adaptation. Lower = faster but less stable.
+# Frame-rate independent: smoothing behaves the same at 30 or 240 fps.
+TEMPORAL_SMOOTHING_GAMMA_TAU = 0.2
 
 # Same idea for luminance. Only active when MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS
 # is False; when True, raw luma is used instead so brightness reacts immediately.
-# Keep this lower than the gamma alpha since hardware brightness changes are
+# Keep this higher than the gamma tau since hardware brightness changes are
 # more visually jarring than a gamma ramp shift.
-TEMPORAL_SMOOTHING_LUMINANCE_ALPHA = 0.05
+TEMPORAL_SMOOTHING_LUMINANCE_TAU = 0.4
 
 
 # -- Misc ---------------------------------------------------------------------
 
 # Minimum luma shift (0-100) required to recompute the tone curve ramp.
-# A small non-zero value avoids redundant ramp writes on near-static content.
-GAMMA_DIFFERENCE_THRESHOLD = 0.1
+# Keeps EMA jitter on near-static content from rewriting the ramp every frame.
+GAMMA_DIFFERENCE_THRESHOLD = 0.5
 
 # Minimum brightness change (0-100) needed to trigger a luminance adjustment.
 # Raise this if brightness flickers on content that is mostly static.
 LUMA_DIFFERENCE_THRESHOLD = 0.0
+
+# When a target brightness stays within LUMA_DIFFERENCE_THRESHOLD of the
+# current value for this long (in seconds), it is applied anyway so brightness
+# converges to the true target instead of staying slightly off forever.
+LUMA_DEADBAND_SETTLE_SECONDS = 2.0
 
 # -- Capture Crop -------------------------------------------------------------
 
