@@ -105,16 +105,41 @@ def scale_gamma_ramp(multiplier: float, ramp: np.ndarray) -> np.ndarray:
 def probe_supported_gamma_range(
     SetDeviceGammaRamp, hdc, base_ramp: np.ndarray
 ) -> tuple[float, float]:
-    # Try every 0.01 step from 0.50 to 1.50 and record which ones the driver accepts.
-    # The result varies by GPU driver and active color profile.
-    accepted = []
-    for raw in range(50, 151):
-        multiplier = raw / 100
-        if SetDeviceGammaRamp(hdc, scale_gamma_ramp(multiplier, base_ramp).ctypes):
-            accepted.append(multiplier)
-    if not accepted:
-        raise RuntimeError("Driver accepted no gamma multipliers in the 0.50-1.50 range.")
-    return min(accepted), max(accepted)
+    # Find the lowest and highest 0.01-step multipliers in [0.50, 1.50] that the
+    # driver accepts. The result varies by GPU driver and active color profile.
+    # Driver validation is a threshold on how far the ramp deviates from linear,
+    # so acceptance is contiguous around 1.0 and each edge can be binary
+    # searched (~12 probes) instead of sweeping all 101 steps, which strobed
+    # the screen visibly at startup.
+    def accepts(raw: int) -> bool:
+        return bool(SetDeviceGammaRamp(hdc, scale_gamma_ramp(raw / 100, base_ramp).ctypes))
+
+    try:
+        if not accepts(100):
+            raise RuntimeError("Driver rejected the unmodified gamma ramp.")
+
+        lo, hi = 50, 100
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if accepts(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        min_raw = lo
+
+        lo, hi = 100, 150
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if accepts(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        max_raw = lo
+    finally:
+        # Leave the screen at the base ramp, not whatever was probed last.
+        SetDeviceGammaRamp(hdc, base_ramp.ctypes)
+
+    return min_raw / 100, max_raw / 100
 
 
 def apply_gamma_ramp(SetDeviceGammaRamp, hdc, ramp: np.ndarray) -> None:
