@@ -34,7 +34,12 @@ separate, hardware-side delay that cannot be measured from software.
 import statistics
 import time
 
-from main import get_primary_monitor_handle, vcp_get_luminance, vcp_set_luminance
+from main import (
+    destroy_physical_monitor_handle,
+    get_primary_monitor_handle,
+    vcp_get_luminance,
+    vcp_set_luminance,
+)
 
 # Brightness values to cycle through. Spread across the full range so the
 # monitor actually has to do work each call rather than ignoring no-op writes.
@@ -77,6 +82,7 @@ def main() -> None:
         print()
         print("Restoring default luminance...")
         vcp_set_luminance(handle, default_luminance)
+        destroy_physical_monitor_handle(handle)
 
     print()
     print("=" * 44)

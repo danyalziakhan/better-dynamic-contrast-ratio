@@ -72,8 +72,13 @@ class PhysicalMonitor(Structure):
 
 def get_physical_monitor_handle(hmonitor) -> HANDLE:
     physical_monitors = (PhysicalMonitor * 1)()
-    windll.dxva2.GetPhysicalMonitorsFromHMONITOR(hmonitor, 1, physical_monitors)
+    if not windll.dxva2.GetPhysicalMonitorsFromHMONITOR(hmonitor, 1, physical_monitors):
+        raise RuntimeError("Failed to get a physical monitor handle from the display monitor.")
     return physical_monitors[0].handle
+
+
+def destroy_physical_monitor_handle(handle) -> None:
+    windll.dxva2.DestroyPhysicalMonitor(HANDLE(handle))
 
 
 def get_primary_monitor_handle() -> HANDLE:
@@ -94,13 +99,23 @@ def vcp_set_luminance(handle, value: int) -> bool:
     return bool(windll.dxva2.SetVCPFeature(HANDLE(handle), BYTE(0x10), DWORD(value)))
 
 
-def vcp_get_luminance(handle) -> int:
+def vcp_get_luminance_range(handle) -> tuple[int, int]:
+    """Read the monitor's current and maximum luminance. The maximum is not
+    always 100; the VCP spec only guarantees the value is in [0, maximum]."""
     current = DWORD()
     maximum = DWORD()
-    windll.dxva2.GetVCPFeatureAndVCPFeatureReply(
+    if not windll.dxva2.GetVCPFeatureAndVCPFeatureReply(
         HANDLE(handle), BYTE(0x10), None, byref(current), byref(maximum)
-    )
-    return current.value
+    ):
+        raise RuntimeError(
+            "Failed to read the monitor's luminance over DDC/CI. "
+            "Make sure DDC/CI is enabled in the monitor's OSD."
+        )
+    return current.value, maximum.value
+
+
+def vcp_get_luminance(handle) -> int:
+    return vcp_get_luminance_range(handle)[0]
 
 
 class VcpLuminanceWriter:
@@ -353,23 +368,6 @@ if __name__ == "__main__":
     min_gamma_multiplier: float = 0.5
     max_gamma_multiplier: float = 1.5
 
-    luminance_map: dict[int, int] = {
-        raw: int(mapped)
-        for raw, mapped in zip(
-            range(101),
-            scale_list(
-                list(range(101)),
-                config.MIN_DESIRED_MONITOR_LUMINANCE,
-                config.MAX_DESIRED_MONITOR_LUMINANCE,
-            ),
-            strict=False,
-        )
-    }
-    print(f"Min monitor luminance: {config.MIN_DESIRED_MONITOR_LUMINANCE}")
-    print(f"Max monitor luminance: {config.MAX_DESIRED_MONITOR_LUMINANCE}")
-    print(f"Monitor luminance values: {', '.join(str(v) for v in luminance_map.values())}")
-    print()
-
     # Separate EMA accumulators for gamma and luminance. They react at different
     # speeds and have independent alphas in config.
     smoothed_luma_gamma: float = -1.0
@@ -403,8 +401,33 @@ if __name__ == "__main__":
             print()
 
         handle = get_physical_monitor_handle(monitor_hmonitor)
-        default_monitor_luminance = vcp_get_luminance(handle)
-        print(f"Default monitor luminance: {default_monitor_luminance}")
+        default_monitor_luminance, max_hardware_luminance = vcp_get_luminance_range(handle)
+        if max_hardware_luminance <= 0:
+            # Some monitors report 0 for the maximum; fall back to the usual range.
+            max_hardware_luminance = 100
+        print(
+            f"Default monitor luminance: {default_monitor_luminance} "
+            f"(hardware range 0-{max_hardware_luminance})"
+        )
+        print()
+
+        # The desired 0-100 window from config, rescaled into the hardware's
+        # reported luminance range (not all monitors use 0-100).
+        luminance_map: dict[int, int] = {
+            raw: int(mapped * max_hardware_luminance / 100)
+            for raw, mapped in zip(
+                range(101),
+                scale_list(
+                    list(range(101)),
+                    config.MIN_DESIRED_MONITOR_LUMINANCE,
+                    config.MAX_DESIRED_MONITOR_LUMINANCE,
+                ),
+                strict=False,
+            )
+        }
+        print(f"Min monitor luminance: {config.MIN_DESIRED_MONITOR_LUMINANCE}")
+        print(f"Max monitor luminance: {config.MAX_DESIRED_MONITOR_LUMINANCE}")
+        print(f"Monitor luminance values: {', '.join(str(v) for v in luminance_map.values())}")
         print()
 
         luminance_writer = VcpLuminanceWriter(
@@ -437,9 +460,15 @@ if __name__ == "__main__":
 
             # Re-derive the physical handle in case the original went stale
             # (e.g. the monitor power-cycled while the program was running).
-            vcp_set_luminance(
-                get_physical_monitor_handle(monitor_hmonitor), default_monitor_luminance
-            )
+            restore_handle = get_physical_monitor_handle(monitor_hmonitor)
+            try:
+                if not vcp_set_luminance(restore_handle, default_monitor_luminance):
+                    print(
+                        f"[!] Could not restore monitor luminance to {default_monitor_luminance}."
+                    )
+            finally:
+                destroy_physical_monitor_handle(restore_handle)
+                destroy_physical_monitor_handle(handle)
 
         atexit.register(restore_defaults)
 
