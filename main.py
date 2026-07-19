@@ -90,6 +90,57 @@ def vcp_get_luminance(handle) -> int:
     return current.value
 
 
+class VcpLuminanceWriter:
+    """Serializes DDC/CI brightness writes on a single dedicated thread.
+
+    Targets go through a one-slot mailbox: submitting while a write is in
+    flight replaces any not-yet-written value, so the monitor always receives
+    the newest target and writes can never pile up or land out of order --
+    which could happen with a thread spawned per change, since concurrent
+    SetVCPFeature calls on the same I2C bus have no ordering guarantee.
+    The pause after each write both gives the DDC/CI receiver time to settle
+    and caps the total write rate (see the EEPROM warning in the README).
+    """
+
+    def __init__(self, handle, min_write_interval_s: float) -> None:
+        self._handle = handle
+        self._min_write_interval_s = min_write_interval_s
+        self._cond = threading.Condition()
+        self._target: int | None = None
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, value: int) -> None:
+        with self._cond:
+            self._target = value
+            self._cond.notify()
+
+    def stop(self) -> None:
+        # Pending unwritten targets are dropped; the caller decides what the
+        # final state should be (e.g. restoring the default luminance).
+        with self._cond:
+            self._stopped = True
+            self._cond.notify()
+        self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while self._target is None and not self._stopped:
+                    self._cond.wait()
+                # The is-None check is unreachable while running (the wait loop
+                # guarantees a target); it doubles as type narrowing.
+                if self._stopped or self._target is None:
+                    return
+                value = self._target
+                self._target = None
+            vcp_set_luminance(self._handle, value)
+            # Sleep outside the lock so newer targets coalesce in the mailbox
+            # while the bus settles.
+            time.sleep(self._min_write_interval_s)
+
+
 def get_default_gamma_ramp(GetDeviceGammaRamp, hdc) -> np.ndarray:
     ramp = np.empty((3, 256), dtype=np.uint16)
     if not GetDeviceGammaRamp(hdc, ramp.ctypes):
@@ -305,6 +356,10 @@ if __name__ == "__main__":
 
     current_monitor_luminance = default_monitor_luminance
 
+    luminance_writer = VcpLuminanceWriter(
+        handle, config.MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS / 1000.0
+    )
+
     # Restore the display on every exit path, not just Ctrl+C: normal exit and
     # unhandled exceptions go through finally/atexit, while closing the console
     # window (or logoff/shutdown) only gives us a console ctrl event, so a
@@ -316,6 +371,9 @@ if __name__ == "__main__":
         if restore_done.is_set():
             return
         restore_done.set()
+
+        # Stop the writer first so no in-flight write races the restore below.
+        luminance_writer.stop()
 
         if (
             config.GAMMA_RAMP_ADJUSTMENTS
@@ -453,11 +511,7 @@ if __name__ == "__main__":
                         # itself, so a separate fade mechanism is not needed
                         continue
 
-                    threading.Thread(
-                        target=vcp_set_luminance,
-                        args=(handle, target_luminance_map_value),
-                        daemon=True,
-                    ).start()
+                    luminance_writer.submit(target_luminance_map_value)
 
                     print(
                         f"Luminance: {target_luminance_map_value} (from {current_monitor_luminance})"

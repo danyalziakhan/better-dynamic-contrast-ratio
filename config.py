@@ -36,6 +36,12 @@ MONITOR_LUMINANCE_ADJUSTMENTS = True
 # whether the target value is smoothed before being sent.
 MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS = False
 
+# Minimum time between DDC/CI brightness writes, in milliseconds. Targets that
+# arrive faster than this are coalesced so only the newest value is sent once
+# the interval elapses. Most monitors need 40-50 ms between commands; raising
+# this also lowers the total write count (see the EEPROM warning in the README).
+MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS = 50
+
 # The hardware brightness range (0-100) is linearly remapped to this window.
 # Narrowing it reduces how aggressively brightness swings between scenes.
 MIN_DESIRED_MONITOR_LUMINANCE = 0
