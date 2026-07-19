@@ -20,7 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# 0 = primary monitor, 1 = secondary monitor.
+# Which monitor to capture and control, as a DXGI output index on the primary
+# adapter (0 is usually the primary monitor, 1 the secondary, and so on).
+# Brightness (DDC/CI) and gamma ramp adjustments target this same monitor.
 MONITOR_INDEX = 0
 
 

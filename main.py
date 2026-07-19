@@ -70,11 +70,24 @@ class PhysicalMonitor(Structure):
     _fields_ = [("handle", HANDLE), ("description", WCHAR * 128)]
 
 
-def get_primary_monitor_handle() -> HANDLE:
-    hmonitor = windll.user32.MonitorFromPoint(0, 0, 1)
+def get_physical_monitor_handle(hmonitor) -> HANDLE:
     physical_monitors = (PhysicalMonitor * 1)()
     windll.dxva2.GetPhysicalMonitorsFromHMONITOR(hmonitor, 1, physical_monitors)
     return physical_monitors[0].handle
+
+
+def get_primary_monitor_handle() -> HANDLE:
+    return get_physical_monitor_handle(windll.user32.MonitorFromPoint(0, 0, 1))
+
+
+def get_display_dc(devicename: str) -> HDC:
+    # A DC bound to the given display device (e.g. r"\\.\DISPLAY2"), unlike
+    # GetDC(None) which always refers to the primary monitor. CreateDC-created
+    # DCs must be freed with DeleteDC, not ReleaseDC.
+    hdc = HDC(windll.gdi32.CreateDCW("DISPLAY", devicename, None, None))
+    if not hdc:
+        raise RuntimeError(f"Failed to create a device context for {devicename}.")
+    return hdc
 
 
 def vcp_set_luminance(handle, value: int) -> bool:
@@ -226,15 +239,14 @@ def apply_gamma_ramp(SetDeviceGammaRamp, hdc, ramp: np.ndarray) -> None:
         raise ValueError("Display driver rejected the gamma ramp.")
 
 
-def reset_gamma_to_default(SetDeviceGammaRamp, base_ramp: np.ndarray) -> None:
+def reset_gamma_to_default(SetDeviceGammaRamp, base_ramp: np.ndarray, devicename: str) -> None:
     # Acquire a fresh DC rather than reusing the one from the main loop, since
     # that one may be in an inconsistent state after an abrupt interrupt.
-    # ReleaseDC needs the window handle (NULL for a screen DC) alongside the DC.
-    fresh_hdc = HDC(windll.user32.GetDC(None))
+    fresh_hdc = get_display_dc(devicename)
     try:
         SetDeviceGammaRamp(fresh_hdc, base_ramp.ctypes)
     finally:
-        windll.user32.ReleaseDC(None, fresh_hdc)
+        windll.gdi32.DeleteDC(fresh_hdc)
 
 
 def vig_scale(v: float, scene_mean: float) -> float:
@@ -341,25 +353,6 @@ if __name__ == "__main__":
     min_gamma_multiplier: float = 0.5
     max_gamma_multiplier: float = 1.5
 
-    if config.GAMMA_RAMP_ADJUSTMENTS:
-        GetDC = windll.user32.GetDC
-        SetDeviceGammaRamp = windll.gdi32.SetDeviceGammaRamp
-        GetDeviceGammaRamp = windll.gdi32.GetDeviceGammaRamp
-
-        hdc = HDC(GetDC(None))
-        if not hdc:
-            raise RuntimeError("Failed to obtain a device context (HDC).")
-
-        default_gamma_ramp = get_default_gamma_ramp(GetDeviceGammaRamp, hdc)
-
-        min_gamma_multiplier, max_gamma_multiplier = probe_supported_gamma_range(
-            SetDeviceGammaRamp, hdc, default_gamma_ramp
-        )
-        print("Adaptive tone curve: ready.")
-        print(f"Tone curve strength:   {config.TONE_CURVE_STRENGTH}")
-        print(f"Driver gamma range:    [{min_gamma_multiplier:.2f}, {max_gamma_multiplier:.2f}]")
-        print()
-
     luminance_map: dict[int, int] = {
         raw: int(mapped)
         for raw, mapped in zip(
@@ -377,61 +370,91 @@ if __name__ == "__main__":
     print(f"Monitor luminance values: {', '.join(str(v) for v in luminance_map.values())}")
     print()
 
-    handle = get_primary_monitor_handle()
-    default_monitor_luminance = vcp_get_luminance(handle)
-    print(f"Default monitor luminance: {default_monitor_luminance}")
-    print()
-
-    luminance_writer = VcpLuminanceWriter(
-        handle,
-        config.MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS / 1000.0,
-        default_monitor_luminance,
-    )
-
-    # Restore the display on every exit path, not just Ctrl+C: normal exit and
-    # unhandled exceptions go through finally/atexit, while closing the console
-    # window (or logoff/shutdown) only gives us a console ctrl event, so a
-    # handler is registered for that too. The flag makes restore idempotent
-    # since more than one of these paths can fire for the same exit.
-    restore_done = threading.Event()
-
-    def restore_defaults() -> None:
-        if restore_done.is_set():
-            return
-        restore_done.set()
-
-        # Stop the writer first so no in-flight write races the restore below.
-        luminance_writer.stop()
-
-        if (
-            config.GAMMA_RAMP_ADJUSTMENTS
-            and SetDeviceGammaRamp is not None
-            and default_gamma_ramp is not None
-        ):
-            reset_gamma_to_default(SetDeviceGammaRamp, default_gamma_ramp)
-
-        vcp_set_luminance(get_primary_monitor_handle(), default_monitor_luminance)
-
-    atexit.register(restore_defaults)
-
-    # CTRL_CLOSE_EVENT = 2, CTRL_LOGOFF_EVENT = 5, CTRL_SHUTDOWN_EVENT = 6.
-    # Ctrl+C / Ctrl+Break (0 and 1) are left to Python's own handler so the
-    # KeyboardInterrupt path still works; returning False passes the event on.
-    @WINFUNCTYPE(BOOL, DWORD)
-    def console_ctrl_handler(event: int) -> bool:
-        if event in (2, 5, 6):
-            restore_defaults()
-        return False
-
-    windll.kernel32.SetConsoleCtrlHandler(console_ctrl_handler, True)
-
     # Separate EMA accumulators for gamma and luminance. They react at different
     # speeds and have independent alphas in config.
     smoothed_luma_gamma: float = -1.0
     smoothed_luma_luminance: float = -1.0
 
-    try:
-        with dxcam.create(output_idx=config.MONITOR_INDEX, output_color="GRAY") as camera:
+    with dxcam.create(output_idx=config.MONITOR_INDEX, output_color="GRAY") as camera:
+        # The camera knows which DXGI output it captures; derive the DDC/CI
+        # handle and the gamma DC from that same output so brightness and
+        # gamma always target the monitor being captured, not just the primary.
+        monitor_hmonitor = camera._output.hmonitor
+        monitor_devicename = camera._output.devicename
+        print(f"Target monitor: {monitor_devicename} (output index {config.MONITOR_INDEX})")
+        print()
+
+        if config.GAMMA_RAMP_ADJUSTMENTS:
+            SetDeviceGammaRamp = windll.gdi32.SetDeviceGammaRamp
+            GetDeviceGammaRamp = windll.gdi32.GetDeviceGammaRamp
+
+            hdc = get_display_dc(monitor_devicename)
+
+            default_gamma_ramp = get_default_gamma_ramp(GetDeviceGammaRamp, hdc)
+
+            min_gamma_multiplier, max_gamma_multiplier = probe_supported_gamma_range(
+                SetDeviceGammaRamp, hdc, default_gamma_ramp
+            )
+            print("Adaptive tone curve: ready.")
+            print(f"Tone curve strength:   {config.TONE_CURVE_STRENGTH}")
+            print(
+                f"Driver gamma range:    [{min_gamma_multiplier:.2f}, {max_gamma_multiplier:.2f}]"
+            )
+            print()
+
+        handle = get_physical_monitor_handle(monitor_hmonitor)
+        default_monitor_luminance = vcp_get_luminance(handle)
+        print(f"Default monitor luminance: {default_monitor_luminance}")
+        print()
+
+        luminance_writer = VcpLuminanceWriter(
+            handle,
+            config.MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS / 1000.0,
+            default_monitor_luminance,
+        )
+
+        # Restore the display on every exit path, not just Ctrl+C: normal exit and
+        # unhandled exceptions go through finally/atexit, while closing the console
+        # window (or logoff/shutdown) only gives us a console ctrl event, so a
+        # handler is registered for that too. The flag makes restore idempotent
+        # since more than one of these paths can fire for the same exit.
+        restore_done = threading.Event()
+
+        def restore_defaults() -> None:
+            if restore_done.is_set():
+                return
+            restore_done.set()
+
+            # Stop the writer first so no in-flight write races the restore below.
+            luminance_writer.stop()
+
+            if (
+                config.GAMMA_RAMP_ADJUSTMENTS
+                and SetDeviceGammaRamp is not None
+                and default_gamma_ramp is not None
+            ):
+                reset_gamma_to_default(SetDeviceGammaRamp, default_gamma_ramp, monitor_devicename)
+
+            # Re-derive the physical handle in case the original went stale
+            # (e.g. the monitor power-cycled while the program was running).
+            vcp_set_luminance(
+                get_physical_monitor_handle(monitor_hmonitor), default_monitor_luminance
+            )
+
+        atexit.register(restore_defaults)
+
+        # CTRL_CLOSE_EVENT = 2, CTRL_LOGOFF_EVENT = 5, CTRL_SHUTDOWN_EVENT = 6.
+        # Ctrl+C / Ctrl+Break (0 and 1) are left to Python's own handler so the
+        # KeyboardInterrupt path still works; returning False passes the event on.
+        @WINFUNCTYPE(BOOL, DWORD)
+        def console_ctrl_handler(event: int) -> bool:
+            if event in (2, 5, 6):
+                restore_defaults()
+            return False
+
+        windll.kernel32.SetConsoleCtrlHandler(console_ctrl_handler, True)
+
+        try:
             screen_h, screen_w = camera.height, camera.width
 
             crop_t = config.CAPTURE_CROP_TOP
@@ -546,10 +569,10 @@ if __name__ == "__main__":
                             f"Luminance: {target_luminance_map_value} (from {current_monitor_luminance})"
                         )
 
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted.\n")
-    finally:
-        print("\n[!] Restoring default display settings.\n")
-        restore_defaults()
-        print("[!] Done.\n")
-        time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[!] Interrupted.\n")
+        finally:
+            print("\n[!] Restoring default display settings.\n")
+            restore_defaults()
+            print("[!] Done.\n")
+            time.sleep(1)
