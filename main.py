@@ -375,16 +375,22 @@ def build_tone_curve_ramp(
     remapped = remap_ratio_to_multiplier(raw_ratio, min_multiplier, max_multiplier)
     effective_ratio = 1.0 + (remapped - 1.0) * internal_strength
 
-    # Backlight compensation: this is what couples the two systems. The curve
-    # is corrected using the backlight actually applied to the hardware, so
-    # when the backlight dims below the reference (ratio < 1) the shadows and
-    # mids are lifted back toward the perceived brightness the content had at
-    # the reference backlight, and pulled down when it brightens above it.
-    # Without this, gamma and backlight both chase the scene mean on their own
-    # timelines and double-dip (dark scene -> backlight dims AND the curve
-    # darkens), which shows up as pumping.
+    # Backlight compensation: nudge the curve using the backlight actually
+    # applied to the hardware so the two systems cooperate -- when the backlight
+    # dims below the reference (ratio < 1) the shadows and mids are lifted a
+    # little back toward the perceived brightness the content had at the
+    # reference backlight, and pulled down when it brightens above it.
+    #
+    # The raw (1/ratio) gain explodes at low backlight (e.g. 7.7x at ratio
+    # 0.13), which -- multiplied onto the near-identity tone curve and clipped
+    # to the driver max -- flattens into a full-strength brightness boost that
+    # blows out dark scenes. So the gain is hard-capped to a narrow band around
+    # 1.0 that only widens with the strength: the compensation stays a gentle
+    # correction, never an override of the tone curve.
     if compensation_strength > 0.0:
         gain = (1.0 / max(backlight_ratio, 0.05)) ** compensation_strength
+        gain_span = 0.3 * compensation_strength
+        gain = min(max(gain, 1.0 - gain_span), 1.0 + gain_span)
         effective_ratio = effective_ratio * gain
 
     effective_ratio = np.clip(effective_ratio, min_multiplier, max_multiplier)
@@ -476,6 +482,7 @@ if __name__ == "__main__":
 
     last_frame_time: float | None = None
     last_gamma_write_time: float = 0.0
+    last_status_time: float = 0.0
     deadband_since: float | None = None
     prev_backlight_ratio: float = 1.0
 
@@ -696,10 +703,8 @@ if __name__ == "__main__":
                         deadband_since,
                         config.LUMA_DEADBAND_SETTLE_SECONDS,
                     )
-                    if apply_change and luminance_writer.submit(target_luminance_map_value):
-                        print(
-                            f"Luminance: {target_luminance_map_value} (from {current_monitor_luminance})"
-                        )
+                    if apply_change:
+                        luminance_writer.submit(target_luminance_map_value)
 
                 if config.GAMMA_RAMP_ADJUSTMENTS:
                     assert SetDeviceGammaRamp is not None
@@ -748,11 +753,25 @@ if __name__ == "__main__":
                         prev_scene_mean_norm = scene_mean_norm
                         prev_backlight_ratio = backlight_ratio
                         last_gamma_write_time = now
-                        print(
-                            f"Tone curve: scene_mean={scene_mean_norm:.3f}  "
-                            f"backlight={backlight_ratio:.2f}  "
-                            f"strength={config.TONE_CURVE_STRENGTH}"
+
+                # Throttled status line. Printing on every adjustment floods the
+                # console and, when the program is capturing that console, feeds
+                # the scrolling text back into the scene statistic and drives a
+                # self-sustaining oscillation. One line per interval avoids both.
+                if (
+                    config.STATUS_LOG_INTERVAL_SECONDS <= 0
+                    or now - last_status_time >= config.STATUS_LOG_INTERVAL_SECONDS
+                ):
+                    parts = [f"scene_mean={raw_mean_luma / 100.0:.3f}"]
+                    if config.MONITOR_LUMINANCE_ADJUSTMENTS:
+                        parts.append(
+                            f"backlight={luminance_writer.effective_luminance()}"
+                            f"->{int(clamp(round(luma_for_luminance), 0, 100))}"
                         )
+                    if config.GAMMA_RAMP_ADJUSTMENTS:
+                        parts.append(f"gamma_strength={config.TONE_CURVE_STRENGTH}")
+                    print("  ".join(parts))
+                    last_status_time = now
 
         except KeyboardInterrupt:
             print("\n[!] Interrupted.\n")

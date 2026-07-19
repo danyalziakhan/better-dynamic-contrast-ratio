@@ -77,15 +77,21 @@ TONE_CURVE_STRENGTH = 0.5
 GAMMA_RAMP_MIN_WRITE_INTERVAL_MS = 33
 
 # Compensate the tone curve for the backlight level actually applied to the
-# hardware, so the two systems cooperate instead of both chasing the scene on
-# their own: when the backlight dims, shadows and mids are lifted back toward
-# how the content looked at your default backlight (whites stay anchored), and
-# pulled down when it brightens. Requires MONITOR_LUMINANCE_ADJUSTMENTS.
-GAMMA_BACKLIGHT_COMPENSATION = True
+# hardware: when the backlight dims, shadows and mids are lifted slightly back
+# toward how the content looked at your default backlight (whites stay
+# anchored), and pulled down when it brightens. Requires
+# MONITOR_LUMINANCE_ADJUSTMENTS.
+#
+# Off by default: with a global backlight this partly undoes the black-level
+# gain that dimming buys you, so on dark scenes it reads as washed out. Turn it
+# on only if you specifically want a constant-perceived-brightness (fake-HDR)
+# look, and keep the strength low.
+GAMMA_BACKLIGHT_COMPENSATION = False
 
-# 0.0 = no compensation, 1.0 = full compensation toward constant perceived
-# brightness. The correction is capped by the driver's accepted gamma window.
-GAMMA_BACKLIGHT_COMPENSATION_STRENGTH = 0.5
+# 0.0 = no compensation. The per-frame gain is hard-capped to a narrow band
+# around 1.0 that widens with this value (roughly +/-30% of it), so even at
+# 1.0 the lift stays gentle and can never blow out shadows.
+GAMMA_BACKLIGHT_COMPENSATION_STRENGTH = 0.4
 
 
 # -- Temporal Smoothing -------------------------------------------------------
@@ -114,13 +120,24 @@ TEMPORAL_SMOOTHING_LUMINANCE_TAU = 0.4
 GAMMA_DIFFERENCE_THRESHOLD = 0.5
 
 # Minimum brightness change (0-100) needed to trigger a luminance adjustment.
-# Raise this if brightness flickers on content that is mostly static.
-LUMA_DIFFERENCE_THRESHOLD = 0.0
+# A small deadband stops the backlight from chasing every one-unit wobble in
+# the scene statistic (which spams DDC/CI writes and can pump visibly). Raise
+# it further if brightness still flickers on mostly-static content; lower it
+# toward 0 for the most responsive tracking.
+LUMA_DIFFERENCE_THRESHOLD = 3.0
 
 # When a target brightness stays within LUMA_DIFFERENCE_THRESHOLD of the
 # current value for this long (in seconds), it is applied anyway so brightness
 # converges to the true target instead of staying slightly off forever.
 LUMA_DEADBAND_SETTLE_SECONDS = 2.0
+
+# Minimum seconds between status lines printed to the console. Printing on
+# every adjustment floods the terminal, and -- if the program happens to be
+# capturing that terminal -- the scrolling text feeds back into the scene
+# statistic and drives a self-sustaining oscillation. Throttling breaks that.
+# Set to 0 to log every change (useful for debugging, not while capturing the
+# console).
+STATUS_LOG_INTERVAL_SECONDS = 1.0
 
 # -- Capture ------------------------------------------------------------------
 
