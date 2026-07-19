@@ -122,6 +122,19 @@ LUMA_DIFFERENCE_THRESHOLD = 0.0
 # converges to the true target instead of staying slightly off forever.
 LUMA_DEADBAND_SETTLE_SECONDS = 2.0
 
+# -- Capture ------------------------------------------------------------------
+
+# Capture frame rate cap. The control loop cannot act faster than the DDC/CI
+# write interval and the gamma write cap anyway, while uncapped capture makes
+# the Desktop Duplication thread copy GPU frames as fast as possible,
+# competing with games for GPU time and adding input lag. 0 = uncapped.
+CAPTURE_TARGET_FPS = 60
+
+# Analyze every Nth pixel in each direction when computing scene statistics.
+# 4 reads 1/16th of the pixels, which is visually indistinguishable for global
+# statistics and cuts CPU/memory traffic accordingly. 1 = full resolution.
+CAPTURE_DOWNSAMPLE_STRIDE = 4
+
 # -- Capture Crop -------------------------------------------------------------
 
 # Crop pixels from each edge of the captured frame before luminance is computed.

@@ -607,7 +607,11 @@ if __name__ == "__main__":
 
             region = (left, top, right, bottom)
 
-            camera.start(region=region, target_fps=0)  # uncapped, runs as fast as possible
+            # Subsampling stride for scene statistics; global statistics do not
+            # need every pixel.
+            sample_stride = max(1, int(config.CAPTURE_DOWNSAMPLE_STRIDE))
+
+            camera.start(region=region, target_fps=config.CAPTURE_TARGET_FPS)
 
             while True:
                 if (frame := camera.get_latest_frame()) is None:
@@ -621,7 +625,7 @@ if __name__ == "__main__":
                     continue
 
                 raw_mean_luma, highlight_norm = scene_statistics(
-                    frame, config.LUMINANCE_SCENE_PERCENTILE
+                    frame[::sample_stride, ::sample_stride], config.LUMINANCE_SCENE_PERCENTILE
                 )
 
                 # Perceptual backlight target (0-100): the highlight percentile
