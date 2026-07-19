@@ -485,6 +485,7 @@ if __name__ == "__main__":
     last_status_time: float = 0.0
     deadband_since: float | None = None
     prev_backlight_ratio: float = 1.0
+    commanded_luminance: float = -1.0
 
     with dxcam.create(output_idx=config.MONITOR_INDEX, output_color="GRAY") as camera:
         # The camera knows which DXGI output it captures; derive the DDC/CI
@@ -684,7 +685,25 @@ if __name__ == "__main__":
                 # for the backlight actually applied, so it must see the
                 # freshest hardware state.
                 if config.MONITOR_LUMINANCE_ADJUSTMENTS:
-                    target_monitor_luminance = int(clamp(round(luma_for_luminance), 0, 100))
+                    # Slew-rate limit the commanded backlight so large target
+                    # jumps (e.g. a scene cut) ramp gradually instead of
+                    # lurching. The EMA above smooths jitter, but its response
+                    # is steepest right after a jump; this bounds the peak rate,
+                    # which is what makes big changes look fast and drastic.
+                    if (
+                        commanded_luminance < 0
+                        or config.MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND <= 0
+                        or config.MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS
+                        or dt <= 0
+                    ):
+                        commanded_luminance = luma_for_luminance
+                    else:
+                        max_step = config.MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND * dt
+                        commanded_luminance += clamp(
+                            luma_for_luminance - commanded_luminance, -max_step, max_step
+                        )
+
+                    target_monitor_luminance = int(clamp(round(commanded_luminance), 0, 100))
                     target_luminance_map_value = luminance_map[target_monitor_luminance]
 
                     # Compare against the writer's view of the hardware state

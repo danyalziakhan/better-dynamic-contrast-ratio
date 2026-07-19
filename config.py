@@ -49,6 +49,14 @@ MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS = 50
 MIN_DESIRED_MONITOR_LUMINANCE = 0
 MAX_DESIRED_MONITOR_LUMINANCE = 100
 
+# Maximum rate the backlight is allowed to move, in brightness units per second.
+# Temporal smoothing filters jitter, but an EMA moves fastest right after a
+# scene cut (a dark->bright cut can lurch ~200+ units/sec at the default time
+# constant), which looks fast and drastic. This caps the peak rate so large
+# jumps ramp gradually and evenly instead of snapping. Lower = calmer/slower,
+# higher = snappier. 0 disables the cap (falls back to smoothing only).
+MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND = 25
+
 # Scene statistic that drives the backlight: a percentile of the luma
 # histogram. 95 tracks the highlights, so a dark scene with a small bright
 # area (moon, torch, muzzle flash) keeps the backlight up instead of crushing
@@ -109,8 +117,9 @@ TEMPORAL_SMOOTHING_GAMMA_TAU = 0.2
 # Same idea for luminance. Only active when MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS
 # is False; when True, raw luma is used instead so brightness reacts immediately.
 # Keep this higher than the gamma tau since hardware brightness changes are
-# more visually jarring than a gamma ramp shift.
-TEMPORAL_SMOOTHING_LUMINANCE_TAU = 0.4
+# more visually jarring than a gamma ramp shift. The peak rate is additionally
+# bounded by MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND.
+TEMPORAL_SMOOTHING_LUMINANCE_TAU = 0.6
 
 
 # -- Misc ---------------------------------------------------------------------
