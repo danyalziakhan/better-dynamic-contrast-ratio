@@ -169,9 +169,21 @@ def main() -> None:
 
     print()
     if reliable is not None:
+        # Keep a margin over the fastest reliable delay; a short sweep can look
+        # cleaner than sustained real-world bursts.
+        suggested = max(reliable, 10)
         print(f"Fastest reliable inter-write interval: {reliable} ms")
-        print(f"Suggested config: MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS = {reliable}")
+        print(f"Suggested config: MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS = {suggested}")
         print("(Keep some margin: the sweep is short; sustained bursts may need more.)")
+        # Translate the cadence into a sustained-rate ceiling for the EEPROM
+        # guard: the peak is 60000/interval writes per minute; the guard should
+        # sit comfortably below that.
+        peak_per_min = int(60000 / suggested)
+        print(
+            f"At that interval the peak is ~{peak_per_min} writes/min; set "
+            f"MONITOR_LUMINANCE_MAX_WRITES_PER_MINUTE below it (default 600) "
+            "to bound sustained wear."
+        )
     else:
         print("No reliable interval found even at the slowest sweep delay;")
         print("keep MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS at 50 or higher.")

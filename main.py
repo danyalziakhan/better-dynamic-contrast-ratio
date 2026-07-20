@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 import atexit
+import collections
 import math
 import threading
 import time
@@ -75,19 +76,25 @@ def percentile_from_histogram(hist: np.ndarray, q: float) -> int:
     return int(np.searchsorted(cum, q * total))
 
 
-def scene_statistics(frame: np.ndarray, highlight_percentile: float) -> tuple[float, float]:
-    """Mean luma (0-100) and highlight level (0-1) of a grayscale frame.
+def scene_statistics(
+    frame: np.ndarray, highlight_percentile: float, shadow_percentile: float
+) -> tuple[float, float, float]:
+    """Mean luma (0-100), highlight level (0-1) and shadow level (0-1).
 
-    Both come from one 256-bin histogram pass. The highlight percentile is a
-    much better backlight driver than the mean: a night scene with a small
-    bright moon and a flat grey scene can share the same mean, but only the
-    percentile tells the backlight that the night scene still has highlights
-    worth preserving.
+    All three come from one 256-bin histogram pass:
+
+    - The highlight percentile (e.g. p95) drives the backlight -- a night scene
+      with a small bright moon and a flat grey scene can share the same mean,
+      but only the percentile tells the backlight the night scene still has
+      highlights worth preserving.
+    - The shadow percentile (e.g. p5) drives the tone curve's shadow lift: a low
+      value means the shadows are crushed and there is detail to recover.
     """
     hist = np.bincount(frame.ravel(), minlength=256)
     mean_luma = float(np.dot(hist, np.arange(256))) / frame.size / 255.0 * 100.0
     highlight = percentile_from_histogram(hist, highlight_percentile / 100.0)
-    return mean_luma, highlight / 255.0
+    shadow = percentile_from_histogram(hist, shadow_percentile / 100.0)
+    return mean_luma, highlight / 255.0, shadow / 255.0
 
 
 class PhysicalMonitor(Structure):
@@ -159,14 +166,24 @@ class VcpLuminanceWriter:
     submit of the still-differing target acts as a natural, rate-limited retry.
     """
 
-    def __init__(self, handle, min_write_interval_s: float, initial_value: int) -> None:
+    def __init__(
+        self,
+        handle,
+        min_write_interval_s: float,
+        initial_value: int,
+        max_writes_per_minute: int = 0,
+    ) -> None:
         self._handle = handle
         self._min_write_interval_s = min_write_interval_s
+        self._max_writes_per_minute = max_writes_per_minute
         self._cond = threading.Condition()
         self._target: int | None = None
         self._last_written = initial_value
         self._write_failing = False
         self._stopped = False
+        # Timestamps of recent successful writes, for the per-minute EEPROM cap.
+        self._write_times: collections.deque[float] = collections.deque()
+        self._cap_warned = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -197,6 +214,24 @@ class VcpLuminanceWriter:
             self._cond.notify()
         self._thread.join(timeout=2.0)
 
+    def _eeprom_cap_wait_seconds(self) -> float:
+        """Seconds to wait before the next write to honor the per-minute cap.
+
+        Ages out timestamps older than 60 s; if the cap would still be exceeded,
+        returns how long until the oldest write leaves the window. 0 means the
+        write may proceed now. The cap is a safety backstop against write
+        runaway that could wear an EEPROM-backed monitor (see the README).
+        """
+        cap = self._max_writes_per_minute
+        if cap <= 0:
+            return 0.0
+        now = time.monotonic()
+        while self._write_times and now - self._write_times[0] >= 60.0:
+            self._write_times.popleft()
+        if len(self._write_times) < cap:
+            return 0.0
+        return 60.0 - (now - self._write_times[0])
+
     def _run(self) -> None:
         while True:
             with self._cond:
@@ -208,11 +243,31 @@ class VcpLuminanceWriter:
                     return
                 value = self._target
                 self._target = None
+
+            wait_s = self._eeprom_cap_wait_seconds()
+            if wait_s > 0.0:
+                with self._cond:
+                    # Re-queue the newest desired value (coalescing with anything
+                    # that arrived meanwhile) and wait until the window frees or a
+                    # change/stop wakes us, then re-evaluate.
+                    if self._target is None:
+                        self._target = value
+                    if not self._cap_warned:
+                        self._cap_warned = True
+                        print(
+                            "[!] Brightness write rate cap reached; throttling writes "
+                            "(MONITOR_LUMINANCE_MAX_WRITES_PER_MINUTE)."
+                        )
+                    self._cond.wait(timeout=wait_s)
+                continue
+
             ok = vcp_set_luminance(self._handle, value)
             with self._cond:
                 if ok:
                     self._last_written = value
                     self._write_failing = False
+                    self._write_times.append(time.monotonic())
+                    self._cap_warned = False
                 elif not self._write_failing:
                     self._write_failing = True
                     print("[!] DDC/CI brightness write failed; retrying with the newest target.")
@@ -288,128 +343,93 @@ def reset_gamma_to_default(SetDeviceGammaRamp, base_ramp: np.ndarray, devicename
         windll.gdi32.DeleteDC(fresh_hdc)
 
 
-def vig_scale(v: float, scene_mean: float) -> float:
-    # Sigmoid-shaped offset centred at scene_mean. Generates the per-level
-    # scaling factor used in the virtual illumination step.
-    r = 1.0 - scene_mean * 0.999999
-    return r * (1.0 / (1.0 + math.exp(-(v - scene_mean))) - 0.5)
-
-
-def remap_ratio_to_multiplier(
-    raw_ratio: np.ndarray, min_multiplier: float, max_multiplier: float
-) -> np.ndarray:
-    # Piecewise-linear remap of the [0, 3] tone curve output into the driver's
-    # accepted multiplier window, anchored so a ratio of 1.0 (no change) maps
-    # to a multiplier of exactly 1.0. A plain linear remap of the whole [0, 3]
-    # range would move the identity point and put a constant darkening bias on
-    # neutral scenes.
-    return np.where(
-        raw_ratio <= 1.0,
-        min_multiplier + np.clip(raw_ratio, 0.0, 1.0) * (1.0 - min_multiplier),
-        1.0 + (np.clip(raw_ratio, 1.0, 3.0) - 1.0) * ((max_multiplier - 1.0) / 2.0),
-    )
-
-
-def build_tone_curve_ramp(
-    base_ramp: np.ndarray,
-    scene_mean_norm: float,
+def build_tone_curve(
+    shadow_norm: float,
     strength: float,
-    min_multiplier: float,
     max_multiplier: float,
     backlight_ratio: float = 1.0,
     compensation_strength: float = 0.0,
 ) -> np.ndarray:
-    # Clamp and scale strength from [0.1, 1.0] down to [0.01, 0.1] internally.
-    internal_strength = max(0.1, min(strength, 1.0)) * 0.1
+    """A normalized tone curve T: [0,1] -> [0,1], sampled at 256 input levels.
 
-    scene_mean = max(scene_mean_norm, 1e-5)
+    This is the single perceptual model. It lifts shadows and, optionally,
+    compensates for the applied backlight, and is expressed purely as a mapping
+    of input luma to output luma:
 
-    # Build the intensity array for all 256 ramp entries.
-    # Index 0 would hit log(0), so clamp it to a small positive value.
-    L = np.arange(256, dtype=np.float64) / 255.0
-    L[0] = 1e-5
+    - White is anchored (T(1) = 1) and black stays black (T(0) = 0), so the
+      curve can never clip highlights or crush blacks by construction -- unlike
+      a flat multiplier on the ramp, which saturates at the top.
+    - Shadow lift is driven by how crushed the shadows are (the p5 percentile):
+      a low ``shadow_norm`` means there is dark detail to recover, so the curve
+      lifts more there.
+    - The effective gain T(x)/x is bounded by the driver's accepted multiplier
+      window (``max_multiplier``) so the composed ramp stays valid and near-black
+      is never blown up.
+    """
+    internal_strength = max(0.0, min(strength, 1.0))
+    x = np.arange(256, dtype=np.float64) / 255.0
 
-    # Keep numeric-error suppression local to this math instead of a global
-    # np.seterr, so real numeric problems elsewhere still surface.
-    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
-        # The guided filter base layer (local illumination estimate) is
-        # approximated by the global scene mean. This makes the effect a global
-        # tone curve rather than per-pixel local adaptation, but still reacts
-        # meaningfully to scene content.
-        R_val = np.log(L) - math.log(scene_mean)
+    # Shadow lift as a gamma curve x**(1/g), g >= 1 -> lifts shadows/mids while
+    # anchoring 0 and 1. Lift grows when the shadows are crushed (low p5) and
+    # with strength, but is capped so it stays a gentle recovery, not a wash-out.
+    shadow_ref = 0.25
+    shadow_crush = min(max((shadow_ref - shadow_norm) / shadow_ref, 0.0), 1.0)
+    g = 1.0 + internal_strength * 0.6 * shadow_crush
+    tone = x ** (1.0 / g)
 
-        # Selective Reflectance Scaling: amplify the reflectance component for
-        # pixels brighter than the scene average.
-        brighter = scene_mean < L
-        factor = np.where(brighter, np.sqrt(np.maximum(L / scene_mean, 0.0)), 1.0)
-        R_new = R_val * factor
-
-        # Virtual Illumination: generate five illumination levels spanning the
-        # luma range, anchored around the scene mean.
-        inv_L = 1.0 - L
-        v1 = 0.2
-        v3 = scene_mean
-        v2 = 0.5 * (v1 + v3)
-        v5 = 0.8
-        v4 = 0.5 * (v3 + v5)
-
-        exp_R_new = np.exp(R_new)
-        A = np.zeros(256, dtype=np.float64)
-        B = np.zeros(256, dtype=np.float64)
-
-        for i, vk in enumerate((v1, v2, v3, v4, v5)):
-            fvk = vig_scale(vk, scene_mean)
-            I_k = (1.0 + fvk) * (L + fvk * inv_L)
-            Lk = exp_R_new * I_k
-            # Lower levels weight by intensity; upper levels weight by complement.
-            wk = np.where(i < 3, I_k, 0.5 * (1.0 - I_k))
-            wk = np.clip(wk, 0.001, 1.0)
-            A += Lk * wk
-            B += wk
-
-        L_final = A / (B + 1e-6)
-        raw_ratio = np.clip(L_final / L, 0.0, 3.0)
-
-    # Remap into the driver's accepted multiplier window (identity-anchored,
-    # so the ramp is always valid), then blend with the identity by strength.
-    remapped = remap_ratio_to_multiplier(raw_ratio, min_multiplier, max_multiplier)
-    effective_ratio = 1.0 + (remapped - 1.0) * internal_strength
-
-    # Backlight compensation: nudge the curve using the backlight actually
-    # applied to the hardware so the two systems cooperate -- when the backlight
-    # dims below the reference (ratio < 1) the shadows and mids are lifted a
-    # little back toward the perceived brightness the content had at the
-    # reference backlight, and pulled down when it brightens above it.
-    #
-    # The raw (1/ratio) gain explodes at low backlight (e.g. 7.7x at ratio
-    # 0.13), which -- multiplied onto the near-identity tone curve and clipped
-    # to the driver max -- flattens into a full-strength brightness boost that
-    # blows out dark scenes. So the gain is hard-capped to a narrow band around
-    # 1.0 that only widens with the strength: the compensation stays a gentle
-    # correction, never an override of the tone curve.
+    # Backlight compensation: a gentle, bounded overall gain that lifts mids when
+    # the backlight has dimmed (ratio < 1) and lowers them when it has brightened
+    # so perceived mid-tones stay closer to constant while black level rides the
+    # backlight. The gain band only widens with compensation_strength, so it can
+    # never override the tone curve or blow out shadows.
     if compensation_strength > 0.0:
         gain = (1.0 / max(backlight_ratio, 0.05)) ** compensation_strength
         gain_span = 0.3 * compensation_strength
         gain = min(max(gain, 1.0 - gain_span), 1.0 + gain_span)
-        effective_ratio = effective_ratio * gain
+        tone = tone * gain
 
-    effective_ratio = np.clip(effective_ratio, min_multiplier, max_multiplier)
+    # Bound the effective gain T(x)/x to the driver-accepted window so the
+    # composed ramp is accepted and near-black cannot explode.
+    min_multiplier = 1.0 / max_multiplier if max_multiplier > 0 else 1.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mult = np.where(x > 0.0, tone / np.maximum(x, 1e-6), 1.0)
+    mult = np.clip(mult, min_multiplier, max_multiplier)
+    tone = x * mult
 
     # White-anchored rolloff: fade the deviation from identity to zero toward
-    # the top of the ramp. A flat multiplier > 1 saturates at 65535 and
-    # hard-clips every highlight above the saturation point; shaping the boost
-    # into the shadows and mids keeps the top of the curve (and the white
-    # point) intact.
-    rolloff = 1.0 - L**3
-    final_ratio = 1.0 + (effective_ratio - 1.0) * rolloff
+    # white so T(1) = 1 exactly and highlights are never touched.
+    rolloff = 1.0 - x**3
+    tone = x + (tone - x) * rolloff
 
-    new_ramp = np.clip(
-        np.round(base_ramp.astype(np.float64) * final_ratio[np.newaxis, :]),
-        0,
-        65535,
-    ).astype(np.uint16)
+    # Monotonic and in-range, so the resampled ramp stays valid.
+    tone = np.clip(tone, 0.0, 1.0)
+    return np.maximum.accumulate(tone)
 
-    return new_ramp
+
+def compose_ramp_with_tone(base_ramp: np.ndarray, tone: np.ndarray) -> np.ndarray:
+    """LUT composition: resample the base ramp through the tone curve.
+
+    ``new_ramp[c][i] = base_ramp[c][ round(tone[i] * 255) ]``. Because the tone
+    curve maps into [0, 1] and is monotonic, the output only ever gathers
+    existing (valid, monotonic) base-ramp entries -- so it cannot clip highlights
+    the way multiplying the ramp values does, and needs no post-clamp.
+    """
+    idx = np.clip(np.round(tone * 255.0), 0, 255).astype(np.intp)
+    return np.ascontiguousarray(base_ramp[:, idx])
+
+
+def build_tone_curve_ramp(
+    base_ramp: np.ndarray,
+    shadow_norm: float,
+    strength: float,
+    max_multiplier: float,
+    backlight_ratio: float = 1.0,
+    compensation_strength: float = 0.0,
+) -> np.ndarray:
+    tone = build_tone_curve(
+        shadow_norm, strength, max_multiplier, backlight_ratio, compensation_strength
+    )
+    return compose_ramp_with_tone(base_ramp, tone)
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
@@ -439,6 +459,39 @@ def ema_alpha(dt: float, tau: float) -> float:
     if tau <= 0.0:
         return 1.0
     return 1.0 - math.exp(-dt / tau)
+
+
+def adaptation_tau(delta: float, drift_tau: float, cut_tau: float, cut_threshold: float) -> float:
+    """Pick the smoothing time constant from the size of the pending change.
+
+    A large jump is a scene cut -- adapt fast (short tau) so the backlight is
+    not left lagging a whole new scene. A small change is drift within a scene
+    -- adapt slowly (long tau) for stability. Between the two the tau blends
+    linearly so there is no abrupt switch in behaviour.
+    """
+    if cut_threshold <= 0:
+        return drift_tau
+    blend = min(abs(delta) / cut_threshold, 1.0)
+    return drift_tau + (cut_tau - drift_tau) * blend
+
+
+def slew_toward(
+    current: float, target: float, dt: float, up_rate: float, down_rate: float
+) -> float:
+    """Move ``current`` toward ``target`` capped at an asymmetric rate.
+
+    Brightening (up) and darkening (down) get separate caps so the backlight can
+    mimic eye adaptation, where adapting to darkness is slower than to light:
+    a smaller ``down_rate`` eases the screen down gently after a bright scene
+    while a larger ``up_rate`` opens it up promptly when a bright scene arrives.
+    """
+    if dt <= 0:
+        return target
+    rate = up_rate if target >= current else down_rate
+    if rate <= 0:
+        return target
+    max_step = rate * dt
+    return current + max(-max_step, min(target - current, max_step))
 
 
 def evaluate_deadband(
@@ -471,20 +524,20 @@ if __name__ == "__main__":
     SetDeviceGammaRamp = None
     hdc: HDC | None = None
     default_gamma_ramp: np.ndarray | None = None
-    prev_scene_mean_norm: float = -1.0
     min_gamma_multiplier: float = 0.5
     max_gamma_multiplier: float = 1.5
 
-    # Separate EMA accumulators for gamma and luminance. They react at different
+    # Separate EMA accumulators. The tone curve tracks the shadow statistic; the
+    # backlight tracks the highlight-derived target. They react at different
     # speeds and have independent time constants in config.
-    smoothed_luma_gamma: float = -1.0
+    smoothed_shadow_norm: float = -1.0
     smoothed_luma_luminance: float = -1.0
 
     last_frame_time: float | None = None
     last_gamma_write_time: float = 0.0
     last_status_time: float = 0.0
     deadband_since: float | None = None
-    prev_backlight_ratio: float = 1.0
+    prev_ramp_key: tuple[int, int] | None = None
     commanded_luminance: float = -1.0
 
     with dxcam.create(output_idx=config.MONITOR_INDEX, output_color="GRAY") as camera:
@@ -548,7 +601,13 @@ if __name__ == "__main__":
             handle,
             config.MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS / 1000.0,
             default_monitor_luminance,
+            config.MONITOR_LUMINANCE_MAX_WRITES_PER_MINUTE,
         )
+
+        # Cache of tone-curve ramps keyed by quantized (shadow, backlight) bins.
+        # build_tone_curve_ramp is 256-entry array math; repeated/oscillating
+        # scenes reuse a precomputed ramp instead of rebuilding it each write.
+        tone_ramp_cache: dict[tuple[int, int], np.ndarray] = {}
 
         # Restore the display on every exit path, not just Ctrl+C: normal exit and
         # unhandled exceptions go through finally/atexit, while closing the console
@@ -655,8 +714,10 @@ if __name__ == "__main__":
                 if frame.size == 0:
                     continue
 
-                raw_mean_luma, highlight_norm = scene_statistics(
-                    frame[::sample_stride, ::sample_stride], config.LUMINANCE_SCENE_PERCENTILE
+                raw_mean_luma, highlight_norm, shadow_norm = scene_statistics(
+                    frame[::sample_stride, ::sample_stride],
+                    config.LUMINANCE_SCENE_PERCENTILE,
+                    config.SHADOW_SCENE_PERCENTILE,
                 )
 
                 # Perceptual backlight target (0-100): the highlight percentile
@@ -666,27 +727,20 @@ if __name__ == "__main__":
                 # of its travel on bright-ish content.
                 raw_backlight_target = 100.0 * (highlight_norm**config.LUMINANCE_MAPPING_EXPONENT)
 
-                # Gamma always uses EMA when smoothing is on, giving the eye
-                # adaptation effect. The EMA weight is derived from the elapsed
-                # wall-clock time between frames, so adaptation speed does not
-                # depend on the capture frame rate.
-                #
-                # For luminance: when FORCE_INSTANT is True, brightness changes
-                # are applied immediately with no smoothing. When False, temporal
-                # smoothing is applied so each brightness update is a smoothed
-                # value rather than a raw frame reading. If both FORCE_INSTANT
-                # and TEMPORAL_SMOOTHING are False, brightness is still applied
-                # instantly, just without any smoothing.
+                # The tone curve's shadow lift is driven by the shadow percentile
+                # and smoothed on the gamma time constant so it does not jitter.
+                # The backlight follows the highlight-derived target; when
+                # smoothing is on it uses scene-cut-adaptive EMA (fast on cuts,
+                # slow on drift), and FORCE_INSTANT bypasses smoothing entirely.
                 if config.TEMPORAL_SMOOTHING:
-                    if smoothed_luma_gamma < 0:
-                        smoothed_luma_gamma = raw_mean_luma
+                    if smoothed_shadow_norm < 0:
+                        smoothed_shadow_norm = shadow_norm
                     else:
-                        smoothed_luma_gamma = ema(
-                            raw_mean_luma,
-                            smoothed_luma_gamma,
+                        smoothed_shadow_norm = ema(
+                            shadow_norm,
+                            smoothed_shadow_norm,
                             ema_alpha(dt, config.TEMPORAL_SMOOTHING_GAMMA_TAU),
                         )
-                    luma_for_gamma = smoothed_luma_gamma
 
                     if config.MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS:
                         luma_for_luminance = raw_backlight_target
@@ -694,14 +748,23 @@ if __name__ == "__main__":
                         if smoothed_luma_luminance < 0:
                             smoothed_luma_luminance = raw_backlight_target
                         else:
+                            # Scene-cut detection: a large gap between the raw
+                            # target and the smoothed value adapts on the fast
+                            # tau; small drift adapts on the slow tau.
+                            tau = adaptation_tau(
+                                raw_backlight_target - smoothed_luma_luminance,
+                                config.TEMPORAL_SMOOTHING_LUMINANCE_TAU,
+                                config.TEMPORAL_SMOOTHING_LUMINANCE_CUT_TAU,
+                                config.LUMINANCE_SCENE_CUT_THRESHOLD,
+                            )
                             smoothed_luma_luminance = ema(
                                 raw_backlight_target,
                                 smoothed_luma_luminance,
-                                ema_alpha(dt, config.TEMPORAL_SMOOTHING_LUMINANCE_TAU),
+                                ema_alpha(dt, tau),
                             )
                         luma_for_luminance = smoothed_luma_luminance
                 else:
-                    luma_for_gamma = raw_mean_luma
+                    smoothed_shadow_norm = shadow_norm
                     luma_for_luminance = raw_backlight_target
 
                 # Backlight first, gamma second: the tone curve compensates
@@ -713,6 +776,8 @@ if __name__ == "__main__":
                     # lurching. The EMA above smooths jitter, but its response
                     # is steepest right after a jump; this bounds the peak rate,
                     # which is what makes big changes look fast and drastic.
+                    # Darkening is capped more tightly than brightening to mimic
+                    # eye adaptation (dark-adapt slower than light-adapt).
                     if (
                         commanded_luminance < 0
                         or config.MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND <= 0
@@ -721,9 +786,12 @@ if __name__ == "__main__":
                     ):
                         commanded_luminance = luma_for_luminance
                     else:
-                        max_step = config.MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND * dt
-                        commanded_luminance += clamp(
-                            luma_for_luminance - commanded_luminance, -max_step, max_step
+                        commanded_luminance = slew_toward(
+                            commanded_luminance,
+                            luma_for_luminance,
+                            dt,
+                            config.MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND,
+                            config.MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND_DARKEN,
                         )
 
                     target_monitor_luminance = int(clamp(round(commanded_luminance), 0, 100))
@@ -753,9 +821,6 @@ if __name__ == "__main__":
                     assert hdc is not None
                     assert default_gamma_ramp is not None
 
-                    scene_mean_norm = luma_for_gamma / 100.0
-                    luma_delta = abs(scene_mean_norm - prev_scene_mean_norm)
-
                     # Ratio of the backlight actually applied to the hardware
                     # vs. the user's default backlight. Feeding the applied
                     # value (not the target) into the tone curve keeps the two
@@ -776,24 +841,29 @@ if __name__ == "__main__":
                         config.GAMMA_RAMP_MIN_WRITE_INTERVAL_MS
                     )
 
-                    ramp_inputs_changed = (
-                        luma_delta > (config.GAMMA_DIFFERENCE_THRESHOLD / 100.0)
-                        or abs(backlight_ratio - prev_backlight_ratio) > 0.01
-                    )
+                    # Quantize the tone-curve inputs into coarse bins. Repeated or
+                    # oscillating scenes then reuse a cached ramp instead of
+                    # rebuilding the 256-entry curve, and a changed bin is what
+                    # signals a meaningful update is due.
+                    shadow_bin = int(clamp(round(smoothed_shadow_norm * 63), 0, 63))
+                    backlight_bin = int(clamp(round(backlight_ratio * 32), 0, 96))
+                    ramp_key = (shadow_bin, backlight_bin)
 
-                    if prev_scene_mean_norm < 0 or (gamma_write_due and ramp_inputs_changed):
-                        tone_ramp = build_tone_curve_ramp(
-                            default_gamma_ramp,
-                            scene_mean_norm,
-                            config.TONE_CURVE_STRENGTH,
-                            min_gamma_multiplier,
-                            max_gamma_multiplier,
-                            backlight_ratio,
-                            compensation_strength,
-                        )
+                    if prev_ramp_key is None or (gamma_write_due and ramp_key != prev_ramp_key):
+                        tone_ramp = tone_ramp_cache.get(ramp_key)
+                        if tone_ramp is None:
+                            tone_ramp = build_tone_curve_ramp(
+                                default_gamma_ramp,
+                                smoothed_shadow_norm,
+                                config.TONE_CURVE_STRENGTH,
+                                max_gamma_multiplier,
+                                backlight_ratio,
+                                compensation_strength,
+                            )
+                            if len(tone_ramp_cache) < 4096:
+                                tone_ramp_cache[ramp_key] = tone_ramp
                         apply_gamma_ramp(SetDeviceGammaRamp, hdc, tone_ramp)
-                        prev_scene_mean_norm = scene_mean_norm
-                        prev_backlight_ratio = backlight_ratio
+                        prev_ramp_key = ramp_key
                         last_gamma_write_time = now
 
                 # Throttled status line. Printing on every adjustment floods the

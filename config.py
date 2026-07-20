@@ -44,24 +44,48 @@ MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS = False
 # this also lowers the total write count (see the EEPROM warning in the README).
 MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS = 50
 
+# EEPROM guard: hard cap on DDC/CI brightness writes per rolling 60 seconds.
+# The min-write-interval already bounds the peak rate; this bounds the sustained
+# rate as a backstop against a write runaway wearing an EEPROM-backed monitor
+# (see the WARNING in the README). When the cap is hit, writes are throttled
+# (the newest target still wins once the window frees). 0 disables the cap.
+MONITOR_LUMINANCE_MAX_WRITES_PER_MINUTE = 600
+
 # The hardware brightness range (0-100) is linearly remapped to this window.
 # Narrowing it reduces how aggressively brightness swings between scenes.
 MIN_DESIRED_MONITOR_LUMINANCE = 0
 MAX_DESIRED_MONITOR_LUMINANCE = 100
 
-# Maximum rate the backlight is allowed to move, in brightness units per second.
-# Temporal smoothing filters jitter, but an EMA moves fastest right after a
-# scene cut (a dark->bright cut can lurch ~200+ units/sec at the default time
-# constant), which looks fast and drastic. This caps the peak rate so large
-# jumps ramp gradually and evenly instead of snapping. Lower = calmer/slower,
-# higher = snappier. 0 disables the cap (falls back to smoothing only).
+# Maximum rate the backlight is allowed to move, in brightness units per second,
+# when brightening (the scene got brighter). Temporal smoothing filters jitter,
+# but an EMA moves fastest right after a scene cut (a dark->bright cut can lurch
+# ~200+ units/sec at the default time constant), which looks fast and drastic.
+# This caps the peak rate so large jumps ramp gradually. Higher = snappier.
+# 0 disables the cap (falls back to smoothing only).
 MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND = 25
+
+# Same cap for darkening (the scene got darker). Human dark-adaptation is slower
+# than light-adaptation, so easing the backlight down more gently than it comes
+# up feels natural and is less distracting. Defaults to 60% of the brighten rate.
+MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND_DARKEN = 15
+
+# Scene-cut handling: when the backlight target jumps by at least this many
+# units (0-100), it is treated as a scene cut and adapts on the fast time
+# constant below; smaller drifts within a scene adapt on the slow one. This
+# keeps the backlight stable during gentle content changes while still catching
+# up promptly on hard cuts.
+LUMINANCE_SCENE_CUT_THRESHOLD = 25
 
 # Scene statistic that drives the backlight: a percentile of the luma
 # histogram. 95 tracks the highlights, so a dark scene with a small bright
 # area (moon, torch, muzzle flash) keeps the backlight up instead of crushing
 # it -- the case where the mean fails. 50 would track the median instead.
 LUMINANCE_SCENE_PERCENTILE = 95
+
+# Percentile that measures how crushed the shadows are; feeds the tone curve's
+# shadow lift (lower = more crushed = more lift). Only used when
+# GAMMA_RAMP_ADJUSTMENTS is on.
+SHADOW_SCENE_PERCENTILE = 5
 
 # Perceptual mapping from that statistic (0-1) to the backlight level: the
 # statistic is raised to this power before entering the brightness window.
@@ -120,12 +144,18 @@ TEMPORAL_SMOOTHING = True
 # Frame-rate independent: smoothing behaves the same at 30 or 240 fps.
 TEMPORAL_SMOOTHING_GAMMA_TAU = 0.2
 
-# Same idea for luminance. Only active when MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS
-# is False; when True, raw luma is used instead so brightness reacts immediately.
-# Keep this higher than the gamma tau since hardware brightness changes are
-# more visually jarring than a gamma ramp shift. The peak rate is additionally
-# bounded by MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND.
+# Same idea for luminance, for gentle drift within a scene. Only active when
+# MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS is False; when True, raw luma is
+# used instead so brightness reacts immediately. Keep this higher than the gamma
+# tau since hardware brightness changes are more visually jarring than a gamma
+# ramp shift. The peak rate is additionally bounded by the max-change-per-second
+# settings above.
 TEMPORAL_SMOOTHING_LUMINANCE_TAU = 0.6
+
+# Faster time constant used when a scene cut is detected (a jump of at least
+# LUMINANCE_SCENE_CUT_THRESHOLD). Lets the backlight catch up promptly on hard
+# cuts without making gentle drift twitchy. Should be smaller than the drift tau.
+TEMPORAL_SMOOTHING_LUMINANCE_CUT_TAU = 0.15
 
 
 # -- Misc ---------------------------------------------------------------------
