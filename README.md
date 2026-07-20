@@ -39,6 +39,18 @@ For content gamma adjustments to work, Windows must have a default system-level 
 
 Only Windows is supported at the moment.
 
+## Recommended usage: backlight here, tone mapping in ReShade
+
+The content gamma (tone curve) adjustment is **disabled by default** (`GAMMA_RAMP_ADJUSTMENTS = False`). It drives the *system-level* gamma ramp, which is a coarse, global control: it applies to the whole desktop, is easy to make look wrong (washed-out shadows, banding), and cannot do anything perceptually smarter than a global curve.
+
+For games, a proper in-engine post-process shader does the tone mapping far better than the gamma ramp ever could. I recommend running this program purely for the **backlight (DDC/CI) side** and letting [ReShade](https://reshade.me/) handle the content side with the **PHDR2.fx** shader I wrote for exactly this pairing:
+
+- **PHDR2.fx**: <https://github.com/danyalziakhan/dz-shaders/blob/main/Shaders/PHDR2.fx>
+
+The two complement each other: this program adapts the physical backlight to the scene (deepening blacks in dark scenes, opening up bright ones), while PHDR2.fx reshapes the in-game image with a real per-frame tone curve that has none of the gamma-ramp's global limitations. Install ReShade for your game, add PHDR2.fx, and keep `GAMMA_RAMP_ADJUSTMENTS = False` here.
+
+If you are not gaming (e.g. video or general desktop use) and still want the content-side lift, you can set `GAMMA_RAMP_ADJUSTMENTS = True`, but keep expectations modest and the `TONE_CURVE_STRENGTH` low.
+
 ## Installation
 
 1. Install **uv**: <https://github.com/astral-sh/uv>

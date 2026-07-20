@@ -553,36 +553,46 @@ if __name__ == "__main__":
         # Restore the display on every exit path, not just Ctrl+C: normal exit and
         # unhandled exceptions go through finally/atexit, while closing the console
         # window (or logoff/shutdown) only gives us a console ctrl event, so a
-        # handler is registered for that too. The flag makes restore idempotent
-        # since more than one of these paths can fire for the same exit.
+        # handler is registered for that too.
+        #
+        # The console ctrl handler fires on a separate OS thread, so restore can
+        # be entered concurrently with the main thread's finally/atexit. The
+        # lock makes the check-set-and-run atomic: a plain "if is_set(): return"
+        # is a race where both callers pass the check and both run the body,
+        # which would double-free the physical monitor handle and issue
+        # overlapping DDC/CI writes.
+        restore_lock = threading.Lock()
         restore_done = threading.Event()
 
         def restore_defaults() -> None:
-            if restore_done.is_set():
-                return
-            restore_done.set()
+            with restore_lock:
+                if restore_done.is_set():
+                    return
+                restore_done.set()
 
-            # Stop the writer first so no in-flight write races the restore below.
-            luminance_writer.stop()
+                # Stop the writer first so no in-flight write races the restore.
+                luminance_writer.stop()
 
-            if (
-                config.GAMMA_RAMP_ADJUSTMENTS
-                and SetDeviceGammaRamp is not None
-                and default_gamma_ramp is not None
-            ):
-                reset_gamma_to_default(SetDeviceGammaRamp, default_gamma_ramp, monitor_devicename)
-
-            # Re-derive the physical handle in case the original went stale
-            # (e.g. the monitor power-cycled while the program was running).
-            restore_handle = get_physical_monitor_handle(monitor_hmonitor)
-            try:
-                if not vcp_set_luminance(restore_handle, default_monitor_luminance):
-                    print(
-                        f"[!] Could not restore monitor luminance to {default_monitor_luminance}."
+                if (
+                    config.GAMMA_RAMP_ADJUSTMENTS
+                    and SetDeviceGammaRamp is not None
+                    and default_gamma_ramp is not None
+                ):
+                    reset_gamma_to_default(
+                        SetDeviceGammaRamp, default_gamma_ramp, monitor_devicename
                     )
-            finally:
-                destroy_physical_monitor_handle(restore_handle)
-                destroy_physical_monitor_handle(handle)
+
+                # Re-derive the physical handle in case the original went stale
+                # (e.g. the monitor power-cycled while the program was running).
+                restore_handle = get_physical_monitor_handle(monitor_hmonitor)
+                try:
+                    if not vcp_set_luminance(restore_handle, default_monitor_luminance):
+                        print(
+                            f"[!] Could not restore monitor luminance to {default_monitor_luminance}."
+                        )
+                finally:
+                    destroy_physical_monitor_handle(restore_handle)
+                    destroy_physical_monitor_handle(handle)
 
         atexit.register(restore_defaults)
 
@@ -619,14 +629,27 @@ if __name__ == "__main__":
             # need every pixel.
             sample_stride = max(1, int(config.CAPTURE_DOWNSAMPLE_STRIDE))
 
-            camera.start(region=region, target_fps=config.CAPTURE_TARGET_FPS)
+            # Cap the per-frame time delta. get_latest_frame() blocks until the
+            # content actually changes, so on static content dt would balloon to
+            # the whole idle gap and let the time-based EMA/slew take one giant
+            # catch-up step -- the "sudden jump" symptom. video_mode below keeps
+            # frames flowing at the target fps so the control loop ticks
+            # continuously and ramps smoothly; this clamp is the safety bound
+            # for the first frame and any scheduling hitch.
+            max_frame_dt = 4.0 / config.CAPTURE_TARGET_FPS if config.CAPTURE_TARGET_FPS > 0 else 0.1
+
+            # video_mode=True re-delivers the last frame each timer tick when the
+            # screen is static, so smoothing and slew-rate limiting keep
+            # advancing toward the target instead of freezing until the next
+            # real change (which would make the next update a large jump).
+            camera.start(region=region, target_fps=config.CAPTURE_TARGET_FPS, video_mode=True)
 
             while True:
                 if (frame := camera.get_latest_frame()) is None:
                     continue
 
                 now = time.perf_counter()
-                dt = 0.0 if last_frame_time is None else now - last_frame_time
+                dt = 0.0 if last_frame_time is None else min(now - last_frame_time, max_frame_dt)
                 last_frame_time = now
 
                 if frame.size == 0:

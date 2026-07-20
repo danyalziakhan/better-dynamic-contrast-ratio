@@ -75,7 +75,13 @@ LUMINANCE_MAPPING_EXPONENT = 2.2
 
 # Recompute and apply a scene-adaptive tone curve to the gamma ramp each frame.
 # Lifts shadows and compresses highlights relative to the current scene average.
-GAMMA_RAMP_ADJUSTMENTS = True
+#
+# Off by default. The system-level gamma ramp is a coarse, global tone control
+# and is easy to make look wrong (washed-out shadows, banding), and for games a
+# proper in-engine shader does this far better. If you play games, drive the
+# tone mapping with a ReShade shader instead (see the README's ReShade section)
+# and leave this off, using this program purely for the backlight (DDC/CI) side.
+GAMMA_RAMP_ADJUSTMENTS = False
 
 # How strongly to apply the tone curve. Range 0.1 (subtle) to 1.0 (full effect).
 TONE_CURVE_STRENGTH = 0.5
