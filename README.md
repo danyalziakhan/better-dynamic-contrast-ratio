@@ -51,9 +51,16 @@ The two complement each other: this program adapts the physical backlight to the
 
 If you are not gaming (e.g. video or general desktop use) and still want the content-side lift, you can set `GAMMA_RAMP_ADJUSTMENTS = True`, but keep expectations modest and the `TONE_CURVE_STRENGTH` low.
 
-## Optional features
+## Dynamic contrast
 
-- **Dynamic contrast (DDC/CI VCP `0x12`)**: set `CONTRAST_ADJUSTMENTS = True` to also adapt the monitor's contrast control — raising it in dark scenes and lowering it in bright ones. It is probed at startup and silently disabled if your monitor doesn't report contrast support. Contrast and brightness share one writer thread (so they interleave on the single I2C bus and share the same per-minute write budget).
+Alongside the backlight, the program also adapts the monitor's **contrast** control (DDC/CI VCP `0x12`) — raising it in dark scenes for a punchier image and lowering it in bright ones. This is **on by default** (`CONTRAST_ADJUSTMENTS = True`); it is probed at startup and silently disabled if your monitor doesn't report contrast support.
+
+Contrast is not a separate control loop — it is derived **instantaneously from the backlight command** (a dimmer backlight → more contrast). Because both are evaluated from the same scene level at the same instant, they move in exact lockstep and always assist each other rather than fighting (an earlier version smoothed contrast independently, which let it lag the backlight and flicker on scene changes).
+
+> Note: DDC/CI writes one feature per command, so brightness and contrast are still two separate writes — they are serialized and interleaved on the single writer thread, sharing one per-minute write budget rather than each running its own. Contrast changes slowly and, with its coarse write deadband, is written infrequently, so it adds only a small number of writes.
+
+## Other features
+
 - **Auto black-bar detection** (`AUTO_BLACK_BAR_DETECTION`, on by default): letterbox/pillarbox bars are detected each frame and excluded from the scene measurement, so a 21:9 film on a 16:9 screen is judged by the image rather than the black bars.
 - **Write-count logging**: each throttled status line and the shutdown message report the number of DDC/CI writes this session, for EEPROM-budget visibility.
 - **`--dry-run`**: `uv run main.py --dry-run` prints every brightness/contrast/gamma decision **without touching the hardware** — useful for tuning `config.py` safely.

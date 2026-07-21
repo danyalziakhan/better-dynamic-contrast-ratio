@@ -52,9 +52,12 @@ MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS = 50
 MONITOR_LUMINANCE_MAX_WRITES_PER_MINUTE = 600
 
 # The hardware brightness range (0-100) is linearly remapped to this window.
-# Narrowing it reduces how aggressively brightness swings between scenes.
-MIN_DESIRED_MONITOR_LUMINANCE = 0
-MAX_DESIRED_MONITOR_LUMINANCE = 100
+# Narrowing it reduces how aggressively brightness swings between scenes, which
+# both looks calmer and keeps the swing on a comparable footing to the contrast
+# window below (rather than brightness sweeping the full 0-100 while contrast
+# only nudges). Widen toward 0-100 for a stronger dimming effect.
+MIN_DESIRED_MONITOR_LUMINANCE = 35
+MAX_DESIRED_MONITOR_LUMINANCE = 90
 
 # Maximum rate the backlight is allowed to move, in brightness units per second,
 # when brightening (the scene got brighter). Temporal smoothing filters jitter,
@@ -92,28 +95,30 @@ SHADOW_SCENE_PERCENTILE = 5
 
 # Also adapt the monitor's contrast control alongside brightness: raise contrast
 # in dark scenes for a punchier image and lower it in bright ones. Contrast is
-# coupled to the backlight (a dimmer backlight -> more contrast) rather than run
-# as a second independent loop, so the two move together instead of fighting and
-# flickering. Contrast writes share the single DDC/CI writer thread and the same
-# per-minute write budget as brightness (they interleave on the one I2C bus).
-# Auto-disabled if the monitor does not report contrast support at start.
-CONTRAST_ADJUSTMENTS = False
+# derived instantaneously from the backlight command (a dimmer backlight -> more
+# contrast) instead of being a second independent loop, so the two are evaluated
+# from the same scene level at the same instant and move in exact lockstep --
+# they always assist each other and never fight. Contrast writes share the single
+# DDC/CI writer thread and the same per-minute write budget as brightness (they
+# interleave on the one I2C bus, so there is no separate write budget to worry
+# about). Auto-disabled if the monitor does not report contrast support at start.
+CONTRAST_ADJUSTMENTS = True
 
-# Contrast (0-100 of the response) is linearly remapped to this window. Kept
-# deliberately narrow around a typical calibrated value so the contrast shifts
-# stay gentle -- contrast is very visible, so a wide window pumps. Widen for a
-# stronger effect, narrow it further (or equal min=max) to damp it toward off.
-MIN_DESIRED_CONTRAST = 50
-MAX_DESIRED_CONTRAST = 72
+# Contrast (0-100 of the response) is linearly remapped to this window, kept on a
+# comparable footing to the brightness window above so neither dominates. Widen
+# for a stronger effect, narrow it (or set min == max) to damp it toward off.
+MIN_DESIRED_CONTRAST = 45
+MAX_DESIRED_CONTRAST = 85
 
 # Perceptual exponent for the fallback APL->contrast mapping, used only when
 # MONITOR_LUMINANCE_ADJUSTMENTS is off (otherwise contrast follows the backlight
 # directly). Higher = contrast only climbs on genuinely dark scenes.
 CONTRAST_MAPPING_EXPONENT = 1.5
 
-# Time constant (seconds) for the extra contrast smoothing on top of the
-# backlight coupling. Contrast shifts are subtle and very visible; keep this
-# slow so contrast eases rather than steps.
+# Time constant (seconds) for contrast smoothing on the fallback (brightness-off)
+# path only. When brightness control is on, contrast tracks the already-smoothed
+# backlight with no extra lag, so this is not applied (extra lag is what made
+# contrast trail the backlight and flicker).
 TEMPORAL_SMOOTHING_CONTRAST_TAU = 1.0
 
 # Minimum contrast change (0-100, hardware units) needed to trigger a write. A

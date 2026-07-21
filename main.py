@@ -984,36 +984,41 @@ if __name__ == "__main__":
                 # the same writer, so contrast interleaves with brightness on the
                 # shared bus and the shared write budget.
                 # Dynamic contrast (VCP 0x12). Contrast and brightness both move
-                # the panel's light output, so running them as two independent
-                # loops that each chase the scene on their own timeline makes the
-                # net luminance overshoot and flicker ("fighting"). Instead,
-                # contrast follows the already smoothed and slew-limited backlight
-                # command: a dimmer backlight -> more contrast, a brighter one ->
-                # less. The two then move in lockstep and assist each other, and
-                # contrast inherits the backlight's smoothness so it cannot
-                # overshoot against it. If brightness control is off, contrast
-                # falls back to driving itself from the scene APL.
+                # the panel's light output, so if their two changes are not
+                # synchronized in *time* their combined output overshoots and
+                # flickers -- even when they are coupled in value. The earlier
+                # version smoothed the coupled contrast with its own EMA on top of
+                # the (already smoothed) backlight, which made contrast lag the
+                # backlight by ~1 s: the backlight would settle and then contrast
+                # would keep drifting, and that trailing shift was the flicker.
+                #
+                # Fix: contrast is an *instantaneous* function of the backlight
+                # command, which is itself already smoothed and slew-limited. Both
+                # are therefore evaluated from the same scene level at the same
+                # instant, so they start, move, and finish together -- always
+                # assisting, never fighting. A dimmer backlight -> more contrast.
+                # (If brightness control is off there is no command to follow, so
+                # contrast drives itself from the scene APL, with smoothing.)
                 if contrast_enabled:
                     if config.MONITOR_LUMINANCE_ADJUSTMENTS and commanded_luminance >= 0:
                         backlight_norm = clamp(commanded_luminance / 100.0, 0.0, 1.0)
-                        raw_contrast_target = 100.0 * (1.0 - backlight_norm)
+                        contrast_command = 100.0 * (1.0 - backlight_norm)
                     else:
                         raw_contrast_target = contrast_target(
                             raw_mean_luma, config.CONTRAST_MAPPING_EXPONENT
                         )
-
-                    if config.TEMPORAL_SMOOTHING:
-                        if smoothed_contrast < 0:
-                            smoothed_contrast = raw_contrast_target
+                        if config.TEMPORAL_SMOOTHING:
+                            if smoothed_contrast < 0:
+                                smoothed_contrast = raw_contrast_target
+                            else:
+                                smoothed_contrast = ema(
+                                    raw_contrast_target,
+                                    smoothed_contrast,
+                                    ema_alpha(dt, config.TEMPORAL_SMOOTHING_CONTRAST_TAU),
+                                )
+                            contrast_command = smoothed_contrast
                         else:
-                            smoothed_contrast = ema(
-                                raw_contrast_target,
-                                smoothed_contrast,
-                                ema_alpha(dt, config.TEMPORAL_SMOOTHING_CONTRAST_TAU),
-                            )
-                        contrast_command = smoothed_contrast
-                    else:
-                        contrast_command = raw_contrast_target
+                            contrast_command = raw_contrast_target
 
                     target_contrast_value = contrast_map[
                         int(clamp(round(contrast_command), 0, 100))
@@ -1088,9 +1093,11 @@ if __name__ == "__main__":
                 ):
                     parts = [f"scene_mean={raw_mean_luma / 100.0:.3f}"]
                     if config.MONITOR_LUMINANCE_ADJUSTMENTS:
+                        # Both values are hardware units (applied -> mapped target)
+                        # so the log reads consistently.
                         parts.append(
                             f"backlight={vcp_writer.effective(VCP_LUMINANCE)}"
-                            f"->{int(clamp(round(luma_for_luminance), 0, 100))}"
+                            f"->{target_luminance_map_value}"
                         )
                     if contrast_enabled:
                         parts.append(f"contrast={vcp_writer.effective(VCP_CONTRAST)}")
