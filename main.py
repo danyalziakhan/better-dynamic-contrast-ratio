@@ -983,10 +983,25 @@ if __name__ == "__main__":
                 # lower it in bright ones. Smoothed slowly and submitted through
                 # the same writer, so contrast interleaves with brightness on the
                 # shared bus and the shared write budget.
+                # Dynamic contrast (VCP 0x12). Contrast and brightness both move
+                # the panel's light output, so running them as two independent
+                # loops that each chase the scene on their own timeline makes the
+                # net luminance overshoot and flicker ("fighting"). Instead,
+                # contrast follows the already smoothed and slew-limited backlight
+                # command: a dimmer backlight -> more contrast, a brighter one ->
+                # less. The two then move in lockstep and assist each other, and
+                # contrast inherits the backlight's smoothness so it cannot
+                # overshoot against it. If brightness control is off, contrast
+                # falls back to driving itself from the scene APL.
                 if contrast_enabled:
-                    raw_contrast_target = contrast_target(
-                        raw_mean_luma, config.CONTRAST_MAPPING_EXPONENT
-                    )
+                    if config.MONITOR_LUMINANCE_ADJUSTMENTS and commanded_luminance >= 0:
+                        backlight_norm = clamp(commanded_luminance / 100.0, 0.0, 1.0)
+                        raw_contrast_target = 100.0 * (1.0 - backlight_norm)
+                    else:
+                        raw_contrast_target = contrast_target(
+                            raw_mean_luma, config.CONTRAST_MAPPING_EXPONENT
+                        )
+
                     if config.TEMPORAL_SMOOTHING:
                         if smoothed_contrast < 0:
                             smoothed_contrast = raw_contrast_target
@@ -1003,6 +1018,9 @@ if __name__ == "__main__":
                     target_contrast_value = contrast_map[
                         int(clamp(round(contrast_command), 0, 100))
                     ]
+                    # A coarse deadband keeps contrast writes infrequent so they
+                    # rarely interleave with brightness writes on the shared bus
+                    # (a stagger between the two is itself visible as flicker).
                     if (
                         abs(target_contrast_value - vcp_writer.effective(VCP_CONTRAST))
                         > config.CONTRAST_DIFFERENCE_THRESHOLD

@@ -91,27 +91,36 @@ SHADOW_SCENE_PERCENTILE = 5
 # -- Dynamic Contrast (DDC/CI VCP 0x12) ---------------------------------------
 
 # Also adapt the monitor's contrast control alongside brightness: raise contrast
-# in dark (low-APL) scenes for a punchier image and lower it in bright scenes to
-# avoid clipping. Contrast writes share the single DDC/CI writer thread and the
-# same per-minute write budget as brightness (they interleave on the one I2C
-# bus). Auto-disabled if the monitor does not report contrast support at start.
+# in dark scenes for a punchier image and lower it in bright ones. Contrast is
+# coupled to the backlight (a dimmer backlight -> more contrast) rather than run
+# as a second independent loop, so the two move together instead of fighting and
+# flickering. Contrast writes share the single DDC/CI writer thread and the same
+# per-minute write budget as brightness (they interleave on the one I2C bus).
+# Auto-disabled if the monitor does not report contrast support at start.
 CONTRAST_ADJUSTMENTS = False
 
-# Contrast (0-100 of the scene response) is linearly remapped to this window.
-# Narrow it to keep contrast near your calibrated value; widen for more effect.
-MIN_DESIRED_CONTRAST = 45
-MAX_DESIRED_CONTRAST = 75
+# Contrast (0-100 of the response) is linearly remapped to this window. Kept
+# deliberately narrow around a typical calibrated value so the contrast shifts
+# stay gentle -- contrast is very visible, so a wide window pumps. Widen for a
+# stronger effect, narrow it further (or equal min=max) to damp it toward off.
+MIN_DESIRED_CONTRAST = 50
+MAX_DESIRED_CONTRAST = 72
 
-# Perceptual exponent mapping scene APL to the contrast response, like the
-# backlight map. Higher = contrast only climbs on genuinely dark scenes.
+# Perceptual exponent for the fallback APL->contrast mapping, used only when
+# MONITOR_LUMINANCE_ADJUSTMENTS is off (otherwise contrast follows the backlight
+# directly). Higher = contrast only climbs on genuinely dark scenes.
 CONTRAST_MAPPING_EXPONENT = 1.5
 
-# Time constant (seconds) for contrast smoothing. Contrast shifts are subtle;
-# keep this slow so it drifts rather than pumps.
+# Time constant (seconds) for the extra contrast smoothing on top of the
+# backlight coupling. Contrast shifts are subtle and very visible; keep this
+# slow so contrast eases rather than steps.
 TEMPORAL_SMOOTHING_CONTRAST_TAU = 1.0
 
-# Minimum contrast change (0-100, in hardware units) needed to trigger a write.
-CONTRAST_DIFFERENCE_THRESHOLD = 2.0
+# Minimum contrast change (0-100, hardware units) needed to trigger a write. A
+# coarse deadband keeps contrast writes infrequent so they rarely stagger with
+# brightness writes on the shared bus (a stagger between the two reads as
+# flicker). Raise it to write contrast even less often.
+CONTRAST_DIFFERENCE_THRESHOLD = 3.0
 
 
 # -- Auto Black-Bar Detection -------------------------------------------------
