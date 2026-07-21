@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import argparse
 import atexit
 import collections
 import math
@@ -97,6 +98,48 @@ def scene_statistics(
     return mean_luma, highlight / 255.0, shadow / 255.0
 
 
+def detect_black_bars(frame: np.ndarray, threshold: int) -> tuple[int, int, int, int]:
+    """Rows/columns to trim from (top, bottom, left, right) for letterbox or
+    pillarbox bars -- contiguous edge rows/columns whose brightest pixel is at
+    or below ``threshold``.
+
+    Only fully-black edge bands qualify (max <= threshold), so genuinely dark
+    content is not mistaken for a bar. If the whole frame is that dark (e.g. a
+    black scene) nothing is cropped, leaving the statistics on the full frame.
+    """
+    g = frame[:, :, 0] if frame.ndim == 3 else frame
+    row_max = g.max(axis=1)
+    col_max = g.max(axis=0)
+    dark_rows = row_max <= threshold
+    dark_cols = col_max <= threshold
+
+    def leading(mask: np.ndarray) -> int:
+        nz = np.flatnonzero(~mask)
+        return int(nz[0]) if nz.size else mask.size
+
+    top = leading(dark_rows)
+    bottom = leading(dark_rows[::-1])
+    left = leading(dark_cols)
+    right = leading(dark_cols[::-1])
+
+    # Guard against cropping everything (all-dark frame) -> no crop.
+    if top + bottom >= g.shape[0] or left + right >= g.shape[1]:
+        return 0, 0, 0, 0
+    return top, bottom, left, right
+
+
+def contrast_target(mean_luma: float, exponent: float) -> float:
+    """Contrast target (0-100) from scene APL (mean luma, 0-100).
+
+    Contrast rises in low-APL (dark) scenes and falls in high-APL (bright)
+    scenes: a dark scene benefits from a punchier curve, while a bright scene
+    would clip if contrast were pushed. The response is 1 - (apl)**exponent so
+    the mapping is perceptual rather than linear, mirroring the backlight map.
+    """
+    apl = min(max(mean_luma / 100.0, 0.0), 1.0)
+    return 100.0 * (1.0 - apl**exponent)
+
+
 class PhysicalMonitor(Structure):
     _fields_ = [("handle", HANDLE), ("description", WCHAR * 128)]
 
@@ -126,89 +169,116 @@ def get_display_dc(devicename: str) -> HDC:
     return hdc
 
 
+# DDC/CI VCP feature codes.
+VCP_LUMINANCE = 0x10
+VCP_CONTRAST = 0x12
+
+
+def vcp_set_feature(handle, code: int, value: int) -> bool:
+    return bool(windll.dxva2.SetVCPFeature(HANDLE(handle), BYTE(code), DWORD(value)))
+
+
+def vcp_get_feature(handle, code: int) -> tuple[int, int] | None:
+    """(current, maximum) for a VCP feature, or None if the monitor does not
+    support it over DDC/CI."""
+    current = DWORD()
+    maximum = DWORD()
+    if not windll.dxva2.GetVCPFeatureAndVCPFeatureReply(
+        HANDLE(handle), BYTE(code), None, byref(current), byref(maximum)
+    ):
+        return None
+    return current.value, maximum.value
+
+
 def vcp_set_luminance(handle, value: int) -> bool:
-    return bool(windll.dxva2.SetVCPFeature(HANDLE(handle), BYTE(0x10), DWORD(value)))
+    return vcp_set_feature(handle, VCP_LUMINANCE, value)
 
 
 def vcp_get_luminance_range(handle) -> tuple[int, int]:
     """Read the monitor's current and maximum luminance. The maximum is not
     always 100; the VCP spec only guarantees the value is in [0, maximum]."""
-    current = DWORD()
-    maximum = DWORD()
-    if not windll.dxva2.GetVCPFeatureAndVCPFeatureReply(
-        HANDLE(handle), BYTE(0x10), None, byref(current), byref(maximum)
-    ):
+    result = vcp_get_feature(handle, VCP_LUMINANCE)
+    if result is None:
         raise RuntimeError(
             "Failed to read the monitor's luminance over DDC/CI. "
             "Make sure DDC/CI is enabled in the monitor's OSD."
         )
-    return current.value, maximum.value
+    return result
 
 
 def vcp_get_luminance(handle) -> int:
     return vcp_get_luminance_range(handle)[0]
 
 
-class VcpLuminanceWriter:
-    """Serializes DDC/CI brightness writes on a single dedicated thread.
+class VcpWriter:
+    """Serializes all DDC/CI feature writes on one dedicated thread.
 
-    Targets go through a one-slot mailbox: submitting while a write is in
-    flight replaces any not-yet-written value, so the monitor always receives
-    the newest target and writes can never pile up or land out of order --
-    which could happen with a thread spawned per change, since concurrent
-    SetVCPFeature calls on the same I2C bus have no ordering guarantee.
-    The pause after each write both gives the DDC/CI receiver time to settle
-    and caps the total write rate (see the EEPROM warning in the README).
+    Every VCP feature this program drives (brightness 0x10 and, optionally,
+    contrast 0x12) shares this single writer so they share the one I2C bus:
+    each feature has its own one-slot mailbox, and the writer interleaves them
+    round-robin, one write per settle interval. Two writer threads would race on
+    the bus with no ordering guarantee; one thread makes writes ordered,
+    coalesced (a newer target replaces an unsent one), and jointly rate-limited
+    -- so contrast writes draw from the same budget as brightness rather than
+    doubling the load on an EEPROM-backed monitor (see the README).
 
-    The writer is also the source of truth for the monitor's luminance state:
-    it only records a value once the driver confirms the write, so a failed
-    write leaves the recorded state at the old value and the caller's next
-    submit of the still-differing target acts as a natural, rate-limited retry.
+    The writer is also the source of truth for each feature's state: it records
+    a value only once the driver confirms the write, so a failed write leaves the
+    state unchanged and the caller's next submit of the still-differing target
+    acts as a natural, rate-limited retry.
     """
 
     def __init__(
         self,
         handle,
         min_write_interval_s: float,
-        initial_value: int,
+        initial: dict[int, int],
         max_writes_per_minute: int = 0,
+        dry_run: bool = False,
     ) -> None:
         self._handle = handle
         self._min_write_interval_s = min_write_interval_s
         self._max_writes_per_minute = max_writes_per_minute
+        self._dry_run = dry_run
         self._cond = threading.Condition()
-        self._target: int | None = None
-        self._last_written = initial_value
-        self._write_failing = False
+        self._codes = list(initial.keys())
+        self._targets: dict[int, int] = {}
+        self._last_written: dict[int, int] = dict(initial)
+        self._write_failing: dict[int, bool] = dict.fromkeys(self._codes, False)
+        self._rr = 0  # round-robin cursor for interleaving codes
+        self._write_count = 0  # session total, for EEPROM-budget visibility
         self._stopped = False
-        # Timestamps of recent successful writes, for the per-minute EEPROM cap.
+        # Timestamps of recent writes, for the per-minute EEPROM cap.
         self._write_times: collections.deque[float] = collections.deque()
         self._cap_warned = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit(self, value: int) -> bool:
-        """Queue a new target. Returns False if it is already the effective
-        state (pending or confirmed written) and nothing was queued."""
+    def submit(self, code: int, value: int) -> bool:
+        """Queue a new target for a feature. Returns False if it already is the
+        effective state (pending or confirmed) and nothing was queued."""
         with self._cond:
             if self._stopped:
                 return False
-            effective = self._target if self._target is not None else self._last_written
+            effective = self._targets.get(code, self._last_written.get(code))
             if value == effective:
                 return False
-            self._target = value
+            self._targets[code] = value
             self._cond.notify()
             return True
 
-    def effective_luminance(self) -> int:
-        """The pending target if one is queued, else the last value the
-        driver confirmed as written."""
+    def effective(self, code: int) -> int:
+        """Pending target for a feature if queued, else the last confirmed write."""
         with self._cond:
-            return self._target if self._target is not None else self._last_written
+            return self._targets.get(code, self._last_written[code])
+
+    def write_count(self) -> int:
+        with self._cond:
+            return self._write_count
 
     def stop(self) -> None:
-        # Pending unwritten targets are dropped; the caller decides what the
-        # final state should be (e.g. restoring the default luminance).
+        # Pending unwritten targets are dropped; the caller decides the final
+        # state (e.g. restoring the defaults).
         with self._cond:
             self._stopped = True
             self._cond.notify()
@@ -219,8 +289,7 @@ class VcpLuminanceWriter:
 
         Ages out timestamps older than 60 s; if the cap would still be exceeded,
         returns how long until the oldest write leaves the window. 0 means the
-        write may proceed now. The cap is a safety backstop against write
-        runaway that could wear an EEPROM-backed monitor (see the README).
+        write may proceed now.
         """
         cap = self._max_writes_per_minute
         if cap <= 0:
@@ -232,47 +301,63 @@ class VcpLuminanceWriter:
             return 0.0
         return 60.0 - (now - self._write_times[0])
 
+    def _pick_next(self) -> int | None:
+        # Round-robin over codes that have a pending target so neither feature
+        # starves the other on the shared bus.
+        pending = [c for c in self._codes if c in self._targets]
+        if not pending:
+            return None
+        self._rr = (self._rr + 1) % len(self._codes)
+        order = self._codes[self._rr :] + self._codes[: self._rr]
+        for code in order:
+            if code in self._targets:
+                return code
+        return pending[0]
+
     def _run(self) -> None:
         while True:
             with self._cond:
-                while self._target is None and not self._stopped:
+                while not self._targets and not self._stopped:
                     self._cond.wait()
-                # The is-None check is unreachable while running (the wait loop
-                # guarantees a target); it doubles as type narrowing.
-                if self._stopped or self._target is None:
+                if self._stopped:
                     return
-                value = self._target
-                self._target = None
+                code = self._pick_next()
+                if code is None:
+                    continue
+                value = self._targets.pop(code)
 
             wait_s = self._eeprom_cap_wait_seconds()
             if wait_s > 0.0:
                 with self._cond:
-                    # Re-queue the newest desired value (coalescing with anything
-                    # that arrived meanwhile) and wait until the window frees or a
-                    # change/stop wakes us, then re-evaluate.
-                    if self._target is None:
-                        self._target = value
+                    # Re-queue the value (coalescing with anything newer) and wait
+                    # until the window frees or a change/stop wakes us.
+                    self._targets.setdefault(code, value)
                     if not self._cap_warned:
                         self._cap_warned = True
                         print(
-                            "[!] Brightness write rate cap reached; throttling writes "
+                            "[!] DDC/CI write rate cap reached; throttling writes "
                             "(MONITOR_LUMINANCE_MAX_WRITES_PER_MINUTE)."
                         )
                     self._cond.wait(timeout=wait_s)
                 continue
 
-            ok = vcp_set_luminance(self._handle, value)
+            ok = True if self._dry_run else vcp_set_feature(self._handle, code, value)
             with self._cond:
                 if ok:
-                    self._last_written = value
-                    self._write_failing = False
+                    self._last_written[code] = value
+                    self._write_failing[code] = False
                     self._write_times.append(time.monotonic())
+                    self._write_count += 1
                     self._cap_warned = False
-                elif not self._write_failing:
-                    self._write_failing = True
-                    print("[!] DDC/CI brightness write failed; retrying with the newest target.")
-            # Sleep outside the lock so newer targets coalesce in the mailbox
-            # while the bus settles.
+                elif not self._write_failing[code]:
+                    self._write_failing[code] = True
+                    print(
+                        f"[!] DDC/CI write of feature 0x{code:02X} failed; "
+                        "retrying with the newest target."
+                    )
+            # Sleep outside the lock so newer targets coalesce while the bus
+            # settles. In dry-run there is no bus, but keep the cadence so the
+            # printed decisions mirror real timing.
             time.sleep(self._min_write_interval_s)
 
 
@@ -521,6 +606,18 @@ def evaluate_deadband(
 
 
 if __name__ == "__main__":
+    arg_parser = argparse.ArgumentParser(description="Better Dynamic Contrast Ratio")
+    arg_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the brightness/contrast/gamma decisions without touching the "
+        "hardware (no DDC/CI writes, no gamma-ramp changes).",
+    )
+    cli_args = arg_parser.parse_args()
+    dry_run: bool = cli_args.dry_run
+    if dry_run:
+        print("[dry-run] No hardware will be changed; decisions are printed only.\n")
+
     SetDeviceGammaRamp = None
     hdc: HDC | None = None
     default_gamma_ramp: np.ndarray | None = None
@@ -528,10 +625,11 @@ if __name__ == "__main__":
     max_gamma_multiplier: float = 1.5
 
     # Separate EMA accumulators. The tone curve tracks the shadow statistic; the
-    # backlight tracks the highlight-derived target. They react at different
-    # speeds and have independent time constants in config.
+    # backlight tracks the highlight-derived target; contrast tracks the APL.
+    # They react at different speeds and have independent time constants.
     smoothed_shadow_norm: float = -1.0
     smoothed_luma_luminance: float = -1.0
+    smoothed_contrast: float = -1.0
 
     last_frame_time: float | None = None
     last_gamma_write_time: float = 0.0
@@ -557,9 +655,14 @@ if __name__ == "__main__":
 
             default_gamma_ramp = get_default_gamma_ramp(GetDeviceGammaRamp, hdc)
 
-            min_gamma_multiplier, max_gamma_multiplier = probe_supported_gamma_range(
-                SetDeviceGammaRamp, hdc, default_gamma_ramp
-            )
+            if dry_run:
+                # Probing writes ramps to the display, so skip it in dry-run and
+                # use the conservative default window instead.
+                print("[dry-run] Skipping gamma-range probe; assuming [0.50, 1.50].")
+            else:
+                min_gamma_multiplier, max_gamma_multiplier = probe_supported_gamma_range(
+                    SetDeviceGammaRamp, hdc, default_gamma_ramp
+                )
             print("Adaptive tone curve: ready.")
             print(f"Tone curve strength:   {config.TONE_CURVE_STRENGTH}")
             print(
@@ -597,11 +700,50 @@ if __name__ == "__main__":
         print(f"Monitor luminance values: {', '.join(str(v) for v in luminance_map.values())}")
         print()
 
-        luminance_writer = VcpLuminanceWriter(
+        # Probe contrast (VCP 0x12) support and, if present, build its map into
+        # the desired window scaled by the reported hardware maximum.
+        contrast_enabled = False
+        default_contrast = 0
+        contrast_map: dict[int, int] = {}
+        if config.CONTRAST_ADJUSTMENTS:
+            contrast_probe = vcp_get_feature(handle, VCP_CONTRAST)
+            if contrast_probe is None:
+                print("Dynamic contrast: monitor does not report contrast support; disabled.")
+                print()
+            else:
+                default_contrast, max_hardware_contrast = contrast_probe
+                if max_hardware_contrast <= 0:
+                    max_hardware_contrast = 100
+                contrast_enabled = True
+                contrast_map = {
+                    raw: int(mapped * max_hardware_contrast / 100)
+                    for raw, mapped in zip(
+                        range(101),
+                        scale_list(
+                            list(range(101)),
+                            config.MIN_DESIRED_CONTRAST,
+                            config.MAX_DESIRED_CONTRAST,
+                        ),
+                        strict=False,
+                    )
+                }
+                print(
+                    f"Dynamic contrast: ready (default {default_contrast}, "
+                    f"hardware range 0-{max_hardware_contrast}, "
+                    f"window {config.MIN_DESIRED_CONTRAST}-{config.MAX_DESIRED_CONTRAST})"
+                )
+                print()
+
+        initial_writes = {VCP_LUMINANCE: default_monitor_luminance}
+        if contrast_enabled:
+            initial_writes[VCP_CONTRAST] = default_contrast
+
+        vcp_writer = VcpWriter(
             handle,
             config.MONITOR_LUMINANCE_MIN_WRITE_INTERVAL_MS / 1000.0,
-            default_monitor_luminance,
+            initial_writes,
             config.MONITOR_LUMINANCE_MAX_WRITES_PER_MINUTE,
+            dry_run,
         )
 
         # Cache of tone-curve ramps keyed by quantized (shadow, backlight) bins.
@@ -630,7 +772,13 @@ if __name__ == "__main__":
                 restore_done.set()
 
                 # Stop the writer first so no in-flight write races the restore.
-                luminance_writer.stop()
+                vcp_writer.stop()
+                print(f"Session DDC/CI writes: {vcp_writer.write_count()}")
+
+                if dry_run:
+                    # Nothing was changed on the hardware, so nothing to restore.
+                    destroy_physical_monitor_handle(handle)
+                    return
 
                 if (
                     config.GAMMA_RAMP_ADJUSTMENTS
@@ -649,6 +797,10 @@ if __name__ == "__main__":
                         print(
                             f"[!] Could not restore monitor luminance to {default_monitor_luminance}."
                         )
+                    if contrast_enabled and not vcp_set_feature(
+                        restore_handle, VCP_CONTRAST, default_contrast
+                    ):
+                        print(f"[!] Could not restore monitor contrast to {default_contrast}.")
                 finally:
                     destroy_physical_monitor_handle(restore_handle)
                     destroy_physical_monitor_handle(handle)
@@ -714,8 +866,19 @@ if __name__ == "__main__":
                 if frame.size == 0:
                     continue
 
+                analysis = frame[::sample_stride, ::sample_stride]
+
+                # Auto black-bar detection: exclude letterbox/pillarbox bars from
+                # the statistics so they do not drag the backlight/contrast down.
+                if config.AUTO_BLACK_BAR_DETECTION:
+                    bt, bb, bl, br = detect_black_bars(analysis, config.BLACK_BAR_LUMA_THRESHOLD)
+                    if bt or bb or bl or br:
+                        analysis = analysis[
+                            bt : analysis.shape[0] - bb, bl : analysis.shape[1] - br
+                        ]
+
                 raw_mean_luma, highlight_norm, shadow_norm = scene_statistics(
-                    frame[::sample_stride, ::sample_stride],
+                    analysis,
                     config.LUMINANCE_SCENE_PERCENTILE,
                     config.SHADOW_SCENE_PERCENTILE,
                 )
@@ -800,7 +963,7 @@ if __name__ == "__main__":
                     # Compare against the writer's view of the hardware state
                     # (pending target, else last driver-confirmed write) so a
                     # failed write is retried instead of being assumed applied.
-                    current_monitor_luminance = luminance_writer.effective_luminance()
+                    current_monitor_luminance = vcp_writer.effective(VCP_LUMINANCE)
 
                     # Delta based on mapped values, i.e. what is actually sent
                     # to the hardware.
@@ -814,7 +977,37 @@ if __name__ == "__main__":
                         config.LUMA_DEADBAND_SETTLE_SECONDS,
                     )
                     if apply_change:
-                        luminance_writer.submit(target_luminance_map_value)
+                        vcp_writer.submit(VCP_LUMINANCE, target_luminance_map_value)
+
+                # Dynamic contrast (VCP 0x12): raise contrast in dark scenes,
+                # lower it in bright ones. Smoothed slowly and submitted through
+                # the same writer, so contrast interleaves with brightness on the
+                # shared bus and the shared write budget.
+                if contrast_enabled:
+                    raw_contrast_target = contrast_target(
+                        raw_mean_luma, config.CONTRAST_MAPPING_EXPONENT
+                    )
+                    if config.TEMPORAL_SMOOTHING:
+                        if smoothed_contrast < 0:
+                            smoothed_contrast = raw_contrast_target
+                        else:
+                            smoothed_contrast = ema(
+                                raw_contrast_target,
+                                smoothed_contrast,
+                                ema_alpha(dt, config.TEMPORAL_SMOOTHING_CONTRAST_TAU),
+                            )
+                        contrast_command = smoothed_contrast
+                    else:
+                        contrast_command = raw_contrast_target
+
+                    target_contrast_value = contrast_map[
+                        int(clamp(round(contrast_command), 0, 100))
+                    ]
+                    if (
+                        abs(target_contrast_value - vcp_writer.effective(VCP_CONTRAST))
+                        > config.CONTRAST_DIFFERENCE_THRESHOLD
+                    ):
+                        vcp_writer.submit(VCP_CONTRAST, target_contrast_value)
 
                 if config.GAMMA_RAMP_ADJUSTMENTS:
                     assert SetDeviceGammaRamp is not None
@@ -826,7 +1019,7 @@ if __name__ == "__main__":
                     # value (not the target) into the tone curve keeps the two
                     # systems in lockstep even while DDC/CI writes lag behind.
                     if config.MONITOR_LUMINANCE_ADJUSTMENTS and config.GAMMA_BACKLIGHT_COMPENSATION:
-                        backlight_ratio = luminance_writer.effective_luminance() / max(
+                        backlight_ratio = vcp_writer.effective(VCP_LUMINANCE) / max(
                             default_monitor_luminance, 1
                         )
                         compensation_strength = config.GAMMA_BACKLIGHT_COMPENSATION_STRENGTH
@@ -862,7 +1055,8 @@ if __name__ == "__main__":
                             )
                             if len(tone_ramp_cache) < 4096:
                                 tone_ramp_cache[ramp_key] = tone_ramp
-                        apply_gamma_ramp(SetDeviceGammaRamp, hdc, tone_ramp)
+                        if not dry_run:
+                            apply_gamma_ramp(SetDeviceGammaRamp, hdc, tone_ramp)
                         prev_ramp_key = ramp_key
                         last_gamma_write_time = now
 
@@ -877,11 +1071,14 @@ if __name__ == "__main__":
                     parts = [f"scene_mean={raw_mean_luma / 100.0:.3f}"]
                     if config.MONITOR_LUMINANCE_ADJUSTMENTS:
                         parts.append(
-                            f"backlight={luminance_writer.effective_luminance()}"
+                            f"backlight={vcp_writer.effective(VCP_LUMINANCE)}"
                             f"->{int(clamp(round(luma_for_luminance), 0, 100))}"
                         )
+                    if contrast_enabled:
+                        parts.append(f"contrast={vcp_writer.effective(VCP_CONTRAST)}")
                     if config.GAMMA_RAMP_ADJUSTMENTS:
                         parts.append(f"gamma_strength={config.TONE_CURVE_STRENGTH}")
+                    parts.append(f"writes={vcp_writer.write_count()}")
                     print("  ".join(parts))
                     last_status_time = now
 

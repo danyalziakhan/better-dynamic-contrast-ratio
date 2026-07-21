@@ -51,6 +51,14 @@ The two complement each other: this program adapts the physical backlight to the
 
 If you are not gaming (e.g. video or general desktop use) and still want the content-side lift, you can set `GAMMA_RAMP_ADJUSTMENTS = True`, but keep expectations modest and the `TONE_CURVE_STRENGTH` low.
 
+## Optional features
+
+- **Dynamic contrast (DDC/CI VCP `0x12`)**: set `CONTRAST_ADJUSTMENTS = True` to also adapt the monitor's contrast control — raising it in dark scenes and lowering it in bright ones. It is probed at startup and silently disabled if your monitor doesn't report contrast support. Contrast and brightness share one writer thread (so they interleave on the single I2C bus and share the same per-minute write budget).
+- **Auto black-bar detection** (`AUTO_BLACK_BAR_DETECTION`, on by default): letterbox/pillarbox bars are detected each frame and excluded from the scene measurement, so a 21:9 film on a 16:9 screen is judged by the image rather than the black bars.
+- **Write-count logging**: each throttled status line and the shutdown message report the number of DDC/CI writes this session, for EEPROM-budget visibility.
+- **`--dry-run`**: `uv run main.py --dry-run` prints every brightness/contrast/gamma decision **without touching the hardware** — useful for tuning `config.py` safely.
+- **Tuning aids**: `test_vcp_latency.py` measures your monitor's write latency and safe cadence; `test_flicker_pattern.py` shows a fullscreen sequence of known-APL scenes so you can watch the response and tune the smoothing/hysteresis objectively.
+
 ## Installation
 
 1. Install **uv**: <https://github.com/astral-sh/uv>

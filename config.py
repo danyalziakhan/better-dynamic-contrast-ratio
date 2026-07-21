@@ -87,6 +87,45 @@ LUMINANCE_SCENE_PERCENTILE = 95
 # GAMMA_RAMP_ADJUSTMENTS is on.
 SHADOW_SCENE_PERCENTILE = 5
 
+
+# -- Dynamic Contrast (DDC/CI VCP 0x12) ---------------------------------------
+
+# Also adapt the monitor's contrast control alongside brightness: raise contrast
+# in dark (low-APL) scenes for a punchier image and lower it in bright scenes to
+# avoid clipping. Contrast writes share the single DDC/CI writer thread and the
+# same per-minute write budget as brightness (they interleave on the one I2C
+# bus). Auto-disabled if the monitor does not report contrast support at start.
+CONTRAST_ADJUSTMENTS = False
+
+# Contrast (0-100 of the scene response) is linearly remapped to this window.
+# Narrow it to keep contrast near your calibrated value; widen for more effect.
+MIN_DESIRED_CONTRAST = 45
+MAX_DESIRED_CONTRAST = 75
+
+# Perceptual exponent mapping scene APL to the contrast response, like the
+# backlight map. Higher = contrast only climbs on genuinely dark scenes.
+CONTRAST_MAPPING_EXPONENT = 1.5
+
+# Time constant (seconds) for contrast smoothing. Contrast shifts are subtle;
+# keep this slow so it drifts rather than pumps.
+TEMPORAL_SMOOTHING_CONTRAST_TAU = 1.0
+
+# Minimum contrast change (0-100, in hardware units) needed to trigger a write.
+CONTRAST_DIFFERENCE_THRESHOLD = 2.0
+
+
+# -- Auto Black-Bar Detection -------------------------------------------------
+
+# Detect letterbox/pillarbox black bars each frame and exclude them from the
+# scene statistics, so a 21:9 film on a 16:9 screen is measured on the image
+# only, not the black bars (which would otherwise drag the backlight down).
+# Applied on top of any manual CAPTURE_CROP_* below.
+AUTO_BLACK_BAR_DETECTION = True
+
+# A row/column counts as a black bar only if its brightest pixel is at or below
+# this luma (0-255). Keep it low so dark content is not mistaken for a bar.
+BLACK_BAR_LUMA_THRESHOLD = 8
+
 # Perceptual mapping from that statistic (0-1) to the backlight level: the
 # statistic is raised to this power before entering the brightness window.
 # 1.0 = linear. 2.2 approximates the display transfer, so the backlight tracks
