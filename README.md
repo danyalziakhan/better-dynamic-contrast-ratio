@@ -57,6 +57,16 @@ Alongside the backlight, the program also adapts the monitor's **contrast** cont
 
 Contrast is not a separate control loop — it is derived **instantaneously from the backlight command** (a dimmer backlight → more contrast). Because both are evaluated from the same scene level at the same instant, they move in exact lockstep and always assist each other rather than fighting (an earlier version smoothed contrast independently, which let it lag the backlight and flicker on scene changes).
 
+### How flicker is avoided
+
+Real backlight controllers filter hard *within* a scene and only respond quickly on a detected **scene cut** — because content that alternates between two levels, or sits near a decision threshold, otherwise makes the controller chase every swing and the screen pumps. This program does the same, in three stages:
+
+1. **Confirmed scene cuts.** A large jump does not immediately trigger fast adaptation; it starts a confirmation timer (`LUMINANCE_SCENE_CUT_CONFIRM_SECONDS`). Only a level that *persists* is accepted as a real cut. Alternating content keeps resetting the timer, never confirms, and is smoothed away instead of chased.
+2. **Heavy in-scene filtering** (`TEMPORAL_SMOOTHING_LUMINANCE_TAU`) plus an asymmetric slew-rate cap, so even an accepted change ramps gradually.
+3. **A write deadband** (`LUMA_DIFFERENCE_THRESHOLD`, `CONTRAST_DIFFERENCE_THRESHOLD`) as the final gate: if the residual ripple stays inside the band, **no write happens at all** and the hardware simply does not move.
+
+In simulation, content alternating once per second between a dark and a bright level — the case that used to pump hardest — now produces **zero** change at the hardware, while a genuine one-time scene cut is still followed. If you want snappier response at the cost of some of this stability, raise `MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND` and lower `LUMINANCE_SCENE_CUT_CONFIRM_SECONDS`.
+
 > Note: DDC/CI writes one feature per command, so brightness and contrast are still two separate writes — they are serialized and interleaved on the single writer thread, sharing one per-minute write budget rather than each running its own. Contrast changes slowly and, with its coarse write deadband, is written infrequently, so it adds only a small number of writes.
 
 ## Other features

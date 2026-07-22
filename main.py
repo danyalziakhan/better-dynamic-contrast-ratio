@@ -546,18 +546,45 @@ def ema_alpha(dt: float, tau: float) -> float:
     return 1.0 - math.exp(-dt / tau)
 
 
-def adaptation_tau(delta: float, drift_tau: float, cut_tau: float, cut_threshold: float) -> float:
-    """Pick the smoothing time constant from the size of the pending change.
+def confirmed_cut_tau(
+    raw_target: float,
+    smoothed: float,
+    candidate_level: float | None,
+    candidate_since: float | None,
+    now: float,
+    drift_tau: float,
+    cut_tau: float,
+    cut_threshold: float,
+    confirm_seconds: float,
+) -> tuple[float, float | None, float | None]:
+    """Choose the smoothing time constant, requiring a scene cut to be *confirmed*.
 
-    A large jump is a scene cut -- adapt fast (short tau) so the backlight is
-    not left lagging a whole new scene. A small change is drift within a scene
-    -- adapt slowly (long tau) for stability. Between the two the tau blends
-    linearly so there is no abrupt switch in behaviour.
+    Reacting fast to every large jump is what makes the backlight flicker: content
+    that alternates between two levels (or sits near a decision threshold) produces
+    a large jump every time it swings, so a magnitude-only rule chases each swing
+    and the screen pumps. Real backlight controllers instead filter hard within a
+    scene and only switch to a fast response on a detected scene cut.
+
+    So a large change starts a confirmation timer instead of immediately adapting
+    fast. Only if the new level *persists* for ``confirm_seconds`` is it accepted
+    as a genuine cut and the fast tau used. Rapid alternation keeps resetting the
+    timer, never confirms, and is therefore smoothed away by the slow tau (the
+    backlight settles near the average and barely moves) -- no flicker.
+
+    Returns (tau, new_candidate_level, new_candidate_since).
     """
-    if cut_threshold <= 0:
-        return drift_tau
-    blend = min(abs(delta) / cut_threshold, 1.0)
-    return drift_tau + (cut_tau - drift_tau) * blend
+    if cut_threshold <= 0 or confirm_seconds <= 0:
+        return drift_tau, None, None
+    if abs(raw_target - smoothed) <= cut_threshold:
+        # Near the current level: nothing pending.
+        return drift_tau, None, None
+    if candidate_since is None or abs(raw_target - candidate_level) > cut_threshold:
+        # A new (or moved) away-level: (re)start confirmation, keep smoothing slow.
+        return drift_tau, raw_target, now
+    if now - candidate_since >= confirm_seconds:
+        # The away-level held long enough to be a real cut: adapt fast.
+        return cut_tau, candidate_level, candidate_since
+    return drift_tau, candidate_level, candidate_since
 
 
 def slew_toward(
@@ -637,6 +664,9 @@ if __name__ == "__main__":
     deadband_since: float | None = None
     prev_ramp_key: tuple[int, int] | None = None
     commanded_luminance: float = -1.0
+    # Pending scene-cut confirmation: the away-level being timed, and when it started.
+    cut_candidate_level: float | None = None
+    cut_candidate_since: float | None = None
 
     with dxcam.create(output_idx=config.MONITOR_INDEX, output_color="GRAY") as camera:
         # The camera knows which DXGI output it captures; derive the DDC/CI
@@ -914,11 +944,19 @@ if __name__ == "__main__":
                             # Scene-cut detection: a large gap between the raw
                             # target and the smoothed value adapts on the fast
                             # tau; small drift adapts on the slow tau.
-                            tau = adaptation_tau(
-                                raw_backlight_target - smoothed_luma_luminance,
+                            # Only a *confirmed* (sustained) jump adapts fast;
+                            # alternating content never confirms and is smoothed
+                            # away instead of chased, which is what stops the pump.
+                            tau, cut_candidate_level, cut_candidate_since = confirmed_cut_tau(
+                                raw_backlight_target,
+                                smoothed_luma_luminance,
+                                cut_candidate_level,
+                                cut_candidate_since,
+                                now,
                                 config.TEMPORAL_SMOOTHING_LUMINANCE_TAU,
                                 config.TEMPORAL_SMOOTHING_LUMINANCE_CUT_TAU,
                                 config.LUMINANCE_SCENE_CUT_THRESHOLD,
+                                config.LUMINANCE_SCENE_CUT_CONFIRM_SECONDS,
                             )
                             smoothed_luma_luminance = ema(
                                 raw_backlight_target,

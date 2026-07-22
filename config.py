@@ -72,12 +72,22 @@ MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND = 25
 # up feels natural and is less distracting. Defaults to 60% of the brighten rate.
 MONITOR_LUMINANCE_MAX_CHANGE_PER_SECOND_DARKEN = 15
 
-# Scene-cut handling: when the backlight target jumps by at least this many
-# units (0-100), it is treated as a scene cut and adapts on the fast time
-# constant below; smaller drifts within a scene adapt on the slow one. This
-# keeps the backlight stable during gentle content changes while still catching
-# up promptly on hard cuts.
+# Scene-cut handling: a backlight-target jump of at least this many units
+# (0-100) is a candidate scene cut. Smaller drifts always use the slow time
+# constant.
 LUMINANCE_SCENE_CUT_THRESHOLD = 25
+
+# How long a candidate jump must PERSIST before it counts as a real scene cut
+# and the fast time constant is used. This is the main anti-flicker guard:
+# content that alternates between two levels (or hovers near a decision
+# threshold) produces a big jump on every swing, and reacting fast to each one
+# is exactly what makes the screen pump. Requiring the new level to hold means
+# alternation never confirms and is smoothed away instead of chased, while a
+# genuine one-time cut confirms and adapts promptly.
+#
+# Raise it to reject slower alternation (at the cost of more lag on real cuts);
+# it must exceed half the period of any alternation you want ignored.
+LUMINANCE_SCENE_CUT_CONFIRM_SECONDS = 0.7
 
 # Scene statistic that drives the backlight: a percentile of the luma
 # histogram. 95 tracks the highlights, so a dark scene with a small bright
@@ -197,18 +207,18 @@ TEMPORAL_SMOOTHING = True
 # Frame-rate independent: smoothing behaves the same at 30 or 240 fps.
 TEMPORAL_SMOOTHING_GAMMA_TAU = 0.2
 
-# Same idea for luminance, for gentle drift within a scene. Only active when
-# MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS is False; when True, raw luma is
-# used instead so brightness reacts immediately. Keep this higher than the gamma
-# tau since hardware brightness changes are more visually jarring than a gamma
-# ramp shift. The peak rate is additionally bounded by the max-change-per-second
-# settings above.
-TEMPORAL_SMOOTHING_LUMINANCE_TAU = 0.6
+# Same idea for luminance: the in-scene ("drift") time constant. This is the
+# filter that runs almost all of the time, and backlight controllers deliberately
+# filter hard here -- limiting the variation within a scene is what keeps the
+# black level (and so the perceived brightness) from visibly wandering. Raise it
+# if any residual pumping remains; lower it for a more reactive backlight.
+# Only active when MONITOR_LUMINANCE_FORCE_INSTANT_ADJUSTMENTS is False.
+TEMPORAL_SMOOTHING_LUMINANCE_TAU = 1.2
 
-# Faster time constant used when a scene cut is detected (a jump of at least
-# LUMINANCE_SCENE_CUT_THRESHOLD). Lets the backlight catch up promptly on hard
-# cuts without making gentle drift twitchy. Should be smaller than the drift tau.
-TEMPORAL_SMOOTHING_LUMINANCE_CUT_TAU = 0.15
+# Faster time constant used only once a scene cut has been CONFIRMED (see
+# LUMINANCE_SCENE_CUT_CONFIRM_SECONDS). Lets the backlight catch up promptly on a
+# genuine cut without ever being used for alternating content.
+TEMPORAL_SMOOTHING_LUMINANCE_CUT_TAU = 0.25
 
 
 # -- Misc ---------------------------------------------------------------------
@@ -217,12 +227,13 @@ TEMPORAL_SMOOTHING_LUMINANCE_CUT_TAU = 0.15
 # Keeps EMA jitter on near-static content from rewriting the ramp every frame.
 GAMMA_DIFFERENCE_THRESHOLD = 0.5
 
-# Minimum brightness change (0-100) needed to trigger a luminance adjustment.
-# A small deadband stops the backlight from chasing every one-unit wobble in
-# the scene statistic (which spams DDC/CI writes and can pump visibly). Raise
-# it further if brightness still flickers on mostly-static content; lower it
+# Minimum brightness change (0-100, hardware units) needed to trigger a write.
+# A deadband stops the backlight from chasing every small wobble in the scene
+# statistic (which spams DDC/CI writes and pumps visibly), and fewer writes also
+# means contrast writes rarely stagger against brightness writes on the shared
+# bus. Raise it further if any flicker remains on mostly-static content; lower it
 # toward 0 for the most responsive tracking.
-LUMA_DIFFERENCE_THRESHOLD = 3.0
+LUMA_DIFFERENCE_THRESHOLD = 4.0
 
 # When a target brightness stays within LUMA_DIFFERENCE_THRESHOLD of the
 # current value for this long (in seconds), it is applied anyway so brightness
